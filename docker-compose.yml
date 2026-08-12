@@ -1,0 +1,45 @@
+# Reproducible zero-state environment for setup-ai-compression.sh
+#
+# Quick start (interactive):
+#   docker compose run --rm setup-test
+#   bash setup-ai-compression.sh
+#
+# Non-interactive full install:
+#   docker compose run --rm \
+#     -e AGENT=cursor \
+#     -e ENABLE_ICM=yes \
+#     -e AUTO_INSTALL_PREREQS=yes \
+#     -e SKIP_AGENT_CHECK=yes \
+#     setup-test bash -lc 'bash setup-ai-compression.sh'
+#
+# Reset everything (fresh home + rebuilt image):
+#   docker compose down --rmi local -v
+#   docker compose build --no-cache setup-test
+
+services:
+  setup-test:
+    build:
+      context: ./docker
+      args:
+        USER_UID: ${USER_UID:-1000}
+        USER_GID: ${USER_GID:-1000}
+    image: personal-workspace-setup:test
+    container_name: pws-setup-test
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+    stdin_open: true
+    tty: true
+    environment:
+      AGENT: ${AGENT:-}
+      ENABLE_ICM: ${ENABLE_ICM:-}
+      ENABLE_GRAPHIFY: ${ENABLE_GRAPHIFY:-}
+      CAVEMAN_LEVEL: ${CAVEMAN_LEVEL:-lite}
+      AUTO_INSTALL_PREREQS: ${AUTO_INSTALL_PREREQS:-}
+      INSTALL_NODEJS: ${INSTALL_NODEJS:-}
+      INSTALL_APT_PACKAGES: ${INSTALL_APT_PACKAGES:-}
+      ALLOW_SUDO: ${ALLOW_SUDO:-}
+      SKIP_AGENT_CHECK: ${SKIP_AGENT_CHECK:-}
+    env_file:
+      - path: docker/.env
+        required: false
