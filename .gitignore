@@ -1,1 +1,6 @@
-new-project
+go-project
+ts-project
+docker/local/
+docker/go/
+docker/cache/
+docker/.env

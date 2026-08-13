@@ -31,4 +31,4 @@
  | -utils | Or helpers, |
  +----------------+-------------------------------------------------+
  
- write those convention, guide as AGENTS.md development instruction
+ write those convention, guide as AGENTS.md development instruction, if you have other recommended best practice instruction, add them if needed

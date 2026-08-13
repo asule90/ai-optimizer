@@ -28,6 +28,9 @@ services:
     working_dir: /workspace
     volumes:
       - .:/workspace
+      - ./docker/go:/home/testuser/go
+      - ./docker/local:/home/testuser/.local
+      - ./docker/cache:/home/testuser/.cache
       - ~/.config/cursor/auth.json:/home/testuser/.config/cursor/auth.json
     stdin_open: true
     ports:

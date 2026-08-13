@@ -54,7 +54,16 @@ RUN groupadd --gid "${USER_GID}" "${USERNAME}" \
   && mkdir -p "${GOPATH}" \
   && chown -R "${USER_UID}:${USER_GID}" "${GOPATH}"
 
-RUN su - "${USERNAME}" -c 'curl https://cursor.com/install -fsS | bash'
+RUN su - "${USERNAME}" -c 'curl https://cursor.com/install -fsS | bash' \
+  && mkdir -p /opt \
+  && cp -a "/home/${USERNAME}/.local/share/cursor-agent" /opt/cursor-agent \
+  && AGENT_BIN="$(find /opt/cursor-agent/versions -maxdepth 2 -type f -name cursor-agent | sort | tail -1)" \
+  && test -n "${AGENT_BIN}" \
+  && ln -sf "${AGENT_BIN}" /usr/local/bin/agent \
+  && ln -sf "${AGENT_BIN}" /usr/local/bin/cursor-agent
+
+# Cursor CLI also lives under ~/.local; bind-mounting ./docker/local hides that.
+# Keep a copy under /opt + /usr/local/bin so `agent` survives re-runs.
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
