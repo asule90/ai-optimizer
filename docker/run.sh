@@ -9,7 +9,7 @@ usage() {
   cat <<'EOF'
 Usage:
   docker/run.sh shell                 Open interactive shell (default)
-  docker/run.sh setup                 Run setup-ai-compression.sh interactively
+  docker/run.sh setup                 Run setup.sh interactively
   docker/run.sh setup-auto            Run setup with AUTO_INSTALL_PREREQS=yes
   docker/run.sh rebuild               Rebuild image from scratch
   docker/run.sh reset                 Remove container image and volumes
@@ -42,7 +42,7 @@ case "$cmd" in
     docker compose run --rm setup-test "$@"
     ;;
   setup)
-    docker compose run --rm setup-test bash -lc 'bash setup-ai-compression.sh'
+    docker compose run --rm setup-test bash -lc 'bash setup.sh'
     ;;
   setup-auto)
     docker compose run --rm \
@@ -51,7 +51,7 @@ case "$cmd" in
       -e INSTALL_APT_PACKAGES=yes \
       -e ALLOW_SUDO=yes \
       -e SKIP_AGENT_CHECK=yes \
-      setup-test bash -lc 'bash setup-ai-compression.sh'
+      setup-test bash -lc 'bash setup.sh'
     ;;
   rebuild)
     docker compose build --no-cache setup-test

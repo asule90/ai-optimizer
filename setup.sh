@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
-# Setup RTK, ICM, Caveman, and QMD for AI agent token compression.
+# Setup RTK, optional ICM or Mem0 memory, and optional QMD or Graphify for AI agent token optimization.
 # Run from the project root (where .git / docs / AGENTS.md live).
 #
-# Cursor / Cursor CLI: ICM uses MCP (~/.cursor/mcp.json) + rule (~/.cursor/rules/icm.mdc).
-# Hooks (icm init --mode hook) are for Claude Code, Gemini, Codex, Copilot, OpenCode — not Cursor.
+# Cursor / Cursor CLI:
+#   ICM  — MCP (~/.cursor/mcp.json) + rule (~/.cursor/rules/icm.mdc); local SQLite, no account
+#   Mem0 — MCP (~/.cursor/mcp.json) + rule (~/.cursor/rules/mem0.mdc); cloud, requires API key
 #
 # Optional env (non-interactive):
 #   AGENT=cursor|github-copilot|antigravity
-#   ENABLE_ICM=yes|no
-#   CAVEMAN_LEVEL=lite|full|ultra|wenyan  (default: lite for Cursor compression rule)
+#   MEMORY_TOOL=icm|mem0|none    — icm: local memory; mem0: cloud memory (needs MEM0_API_KEY)
+#   DOCS_TOOL=qmd|graphify|none  — qmd: semantic search over docs/**/*.md; graphify: knowledge graph for larger repos
 #   AUTO_INSTALL_PREREQS=yes|no  — approve all system prerequisite installs
-#   INSTALL_NODEJS=yes|no        — Node.js 22+ via package manager (sudo)
+#   INSTALL_NODEJS=yes|no        — Node.js 22+ via package manager (sudo; required for QMD)
 #   INSTALL_APT_PACKAGES=yes|no  — apt packages such as pipx (sudo)
 #   ALLOW_SUDO=yes|no            — sudo for npm global installs / permission fixes
 #   SKIP_AGENT_CHECK=yes|no      — skip Cursor/Copilot/Antigravity install verification (e.g. Docker)
+#   MEM0_API_KEY=m0-...          — Mem0 Platform API key (https://app.mem0.ai); only when MEMORY_TOOL=mem0
+# Back-compat: ENABLE_ICM=yes|no or ENABLE_MEM0=yes|no map to MEMORY_TOOL when MEMORY_TOOL is unset
 set -e
 
 # -------------------------------
@@ -102,7 +105,7 @@ ensure_path_contains() {
   fi
 }
 
-# RTK, ICM, Graphify, and Antigravity CLI install into ~/.local/bin.
+# RTK, Graphify, and Antigravity CLI install into ~/.local/bin.
 ensure_local_bin_on_path() {
   ensure_path_contains "$HOME/.local/bin"
 }
@@ -121,6 +124,10 @@ require_command() {
 ensure_agent_home_dirs() {
   mkdir -p "$HOME/.local/bin"
 
+  # RTK writes state under ~/.config/rtk. Docker bind-mounts (e.g. auth.json →
+  # ~/.config/cursor/auth.json) often create ~/.config as root-owned; fix that.
+  ensure_config_dir_writable
+
   case "$AGENT" in
     cursor|github-copilot)
       mkdir -p "$HOME/.cursor/rules"
@@ -132,6 +139,34 @@ ensure_agent_home_dirs() {
       mkdir -p "$HOME/.gemini"
       ;;
   esac
+}
+
+ensure_config_dir_writable() {
+  local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}"
+
+  if [[ ! -d "$config_dir" ]]; then
+    mkdir -p "$config_dir"
+  fi
+
+  if [[ -w "$config_dir" ]]; then
+    mkdir -p "${config_dir}/rtk"
+    return 0
+  fi
+
+  echo "⚠️ ${config_dir} is not writable by $(whoami) (common with Docker file bind-mounts)."
+  if ask_permission "Fix ownership of ${config_dir}? (requires sudo)" "ALLOW_SUDO"; then
+    echo "🔧 Fixing ownership of ${config_dir}..."
+    sudo_cmd chown -R "$(id -u):$(id -g)" "$config_dir"
+  fi
+
+  if [[ ! -w "$config_dir" ]]; then
+    echo "❌ Cannot write to ${config_dir}."
+    echo "👉 Run: sudo chown -R $(id -u):$(id -g) ${config_dir}"
+    echo "   (Docker: auth.json mounts often leave ~/.config root-owned.)"
+    exit 1
+  fi
+
+  mkdir -p "${config_dir}/rtk"
 }
 
 agent_cursor_installed() {
@@ -216,7 +251,7 @@ require_agent_installed() {
   esac
 }
 
-echo "🚀 AI Compression Setup (RTK + ICM + Caveman + QMD)"
+echo "🚀 AI Optimizer Setup (RTK + ICM/Mem0 + QMD/Graphify)"
 echo "===================================================="
 
 # -------------------------------
@@ -252,35 +287,42 @@ esac
 require_agent_installed
 
 # -------------------------------
-# ICM (agent-specific; see https://github.com/rtk-ai/icm/docs/integrations.md)
+# DOCS TOOL: QMD or Graphify (mutually exclusive)
 # -------------------------------
 
-icm_default_for_agent() {
-  case "$AGENT" in
-    cursor) echo "yes" ;;
-    *)      echo "no" ;;
-  esac
+select_docs_tool() {
+  if [[ -z "${DOCS_TOOL:-}" && -n "${ENABLE_GRAPHIFY:-}" ]]; then
+    if env_is_yes "${ENABLE_GRAPHIFY}"; then
+      DOCS_TOOL="graphify"
+      echo "ℹ️  Mapping ENABLE_GRAPHIFY=yes -> DOCS_TOOL=graphify"
+      return 0
+    fi
+  fi
+
+  if [[ -n "${DOCS_TOOL:-}" ]]; then
+    case "${DOCS_TOOL}" in
+      qmd|graphify|none)
+        echo "Using DOCS_TOOL=${DOCS_TOOL} from environment."
+        return 0
+        ;;
+      *)
+        echo "❌ Unknown DOCS_TOOL: ${DOCS_TOOL} (use qmd, graphify, or none)"
+        exit 1
+        ;;
+    esac
+  fi
+
+  echo ""
+  echo "Choose a documentation/codebase context tool (pick one):"
+  echo "  • QMD       — semantic search over docs/**/*.md (smaller projects, markdown docs only)"
+  echo "  • Graphify  — knowledge graph over code/docs (larger codebases, monorepos)"
+  echo "  • None      — skip both"
+  select DOCS_TOOL in "qmd" "graphify" "none"; do
+    [[ -n "$DOCS_TOOL" ]] && break
+  done
 }
 
-if [[ -n "${ENABLE_ICM:-}" ]]; then
-  echo "Using ENABLE_ICM=${ENABLE_ICM} from environment."
-else
-  default_icm="$(icm_default_for_agent)"
-  if [[ "$AGENT" == "cursor" ]]; then
-    echo "Enable ICM for Cursor? (MCP server + ~/.cursor/rules/icm.mdc — not shell hooks)"
-    echo "  Hooks auto-extract only for Claude Code / Gemini / Codex / Copilot CLI."
-  else
-    echo "Enable ICM? (mode depends on agent; may require ~/.gemini write access for some tools)"
-  fi
-  icm_prompt_default="No"
-  [[ "$default_icm" == "yes" ]] && icm_prompt_default="Yes"
-  select ICM_CHOICE in "No" "Yes"; do
-    case "$ICM_CHOICE" in
-      Yes) ENABLE_ICM="yes"; break ;;
-      No)  ENABLE_ICM="no"; break ;;
-    esac
-  done
-fi
+select_docs_tool
 
 # -------------------------------
 # GLOBAL: RTK
@@ -297,14 +339,72 @@ require_command rtk "RTK installs to ~/.local/bin. Run: export PATH=\"\$HOME/.lo
 ensure_agent_home_dirs
 
 echo "🔧 Configuring RTK for ${AGENT}..."
+# --auto-patch: avoid interactive "Patch settings.json?" prompts (Claude side-effect on Cursor init).
+# --no-patch would skip patching entirely; we want hooks installed without blocking on stdin.
 if [[ "$AGENT" == "antigravity" ]]; then
-  rtk init $RTK_FLAG
+  rtk init --auto-patch $RTK_FLAG
 else
-  rtk init -g $RTK_FLAG
+  rtk init -g --auto-patch $RTK_FLAG
 fi
 
 # -------------------------------
-# GLOBAL: ICM
+# MEMORY: ICM (local) or Mem0 (cloud) — mutually exclusive
+# -------------------------------
+
+select_memory_tool() {
+  if [[ -n "${MEMORY_TOOL:-}" ]]; then
+    case "${MEMORY_TOOL}" in
+      icm|mem0|none)
+        echo "Using MEMORY_TOOL=${MEMORY_TOOL} from environment."
+        return 0
+        ;;
+      *)
+        echo "❌ Unknown MEMORY_TOOL: ${MEMORY_TOOL} (use icm, mem0, or none)"
+        exit 1
+        ;;
+    esac
+  fi
+
+  if [[ -n "${ENABLE_ICM:-}" ]]; then
+    if env_is_yes "${ENABLE_ICM}"; then
+      MEMORY_TOOL="icm"
+      echo "ℹ️  Mapping ENABLE_ICM=yes -> MEMORY_TOOL=icm"
+      return 0
+    fi
+    if env_is_no "${ENABLE_ICM}"; then
+      MEMORY_TOOL="none"
+      echo "ℹ️  Mapping ENABLE_ICM=no -> MEMORY_TOOL=none"
+      return 0
+    fi
+  fi
+
+  if [[ -n "${ENABLE_MEM0:-}" ]]; then
+    if env_is_yes "${ENABLE_MEM0}"; then
+      MEMORY_TOOL="mem0"
+      echo "ℹ️  Mapping ENABLE_MEM0=yes -> MEMORY_TOOL=mem0"
+      return 0
+    fi
+    if env_is_no "${ENABLE_MEM0}"; then
+      MEMORY_TOOL="none"
+      echo "ℹ️  Mapping ENABLE_MEM0=no -> MEMORY_TOOL=none"
+      return 0
+    fi
+  fi
+
+  echo ""
+  echo "Choose a memory tool (pick one):"
+  echo "  • ICM   — local SQLite memory, no account (https://github.com/rtk-ai/icm)"
+  echo "  • Mem0  — cloud memory, requires API key (https://github.com/mem0ai/mem0)"
+  echo "  • None  — skip memory"
+  select MEMORY_TOOL in "icm" "mem0" "none"; do
+    [[ -n "$MEMORY_TOOL" ]] && break
+  done
+}
+
+select_memory_tool
+
+# -------------------------------
+# ICM (https://github.com/rtk-ai/icm)
 # -------------------------------
 
 ensure_gemini_settings_path() {
@@ -336,7 +436,7 @@ install_icm_if_missing() {
 }
 
 icm_init_force=()
-if icm init --help 2>&1 | grep -q -- '--force'; then
+if command -v icm &>/dev/null && icm init --help 2>&1 | grep -q -- '--force'; then
   icm_init_force=(--force)
 fi
 
@@ -399,43 +499,235 @@ setup_icm_for_agent() {
   fi
 }
 
-if [[ "$ENABLE_ICM" == "yes" ]]; then
-  setup_icm_for_agent
-else
-  echo "⏭️ Skipping ICM initialization."
-fi
-
 # -------------------------------
-# Cursor: compression rule (RTK + QMD + caveman lite) — separate from icm.mdc
+# Mem0 (https://github.com/mem0ai/mem0)
 # -------------------------------
 
-CAVEMAN_LEVEL="${CAVEMAN_LEVEL:-lite}"
+ensure_mem0_api_key() {
+  if [[ -n "${MEM0_API_KEY:-}" ]]; then
+    echo "✅ MEM0_API_KEY is set."
+    return 0
+  fi
+
+  echo ""
+  echo "Mem0 requires an API key from https://app.mem0.ai"
+  if ! is_interactive; then
+    echo "❌ Set MEM0_API_KEY and re-run."
+    exit 1
+  fi
+
+  read -rsp "Enter MEM0_API_KEY (starts with m0-): " MEM0_API_KEY
+  echo ""
+  if [[ -z "$MEM0_API_KEY" ]]; then
+    echo "❌ API key required for Mem0."
+    exit 1
+  fi
+  export MEM0_API_KEY
+
+  echo ""
+  echo "Persist MEM0_API_KEY in your shell profile?"
+  select PERSIST_CHOICE in "No" "Yes"; do
+    case "$PERSIST_CHOICE" in
+      Yes)
+        local rc_file="$HOME/.bashrc"
+        if [[ -n "${ZSH_VERSION:-}" ]] || [[ "${SHELL:-}" == *zsh* ]]; then
+          rc_file="$HOME/.zshrc"
+        fi
+        if ! grep -q 'MEM0_API_KEY=' "$rc_file" 2>/dev/null; then
+          echo "export MEM0_API_KEY=\"${MEM0_API_KEY}\"" >> "$rc_file"
+          echo "✅ Added MEM0_API_KEY to ${rc_file}"
+        else
+          echo "ℹ️  MEM0_API_KEY already present in ${rc_file}"
+        fi
+        break
+        ;;
+      No) break ;;
+    esac
+  done
+}
+
+merge_mem0_into_cursor_mcp() {
+  local mcp_file="$HOME/.cursor/mcp.json"
+  mkdir -p "$HOME/.cursor"
+
+  if ! command -v python3 &>/dev/null; then
+    echo "⚠️ python3 not found; writing minimal ~/.cursor/mcp.json for Mem0."
+    cat > "$mcp_file" << 'EOF'
+{
+  "mcpServers": {
+    "mem0": {
+      "url": "https://mcp.mem0.ai/mcp/",
+      "headers": {
+        "Authorization": "Token ${env:MEM0_API_KEY}"
+      }
+    }
+  }
+}
+EOF
+    return 0
+  fi
+
+  MEM0_MCP_FILE="$mcp_file" python3 << 'PY'
+import json
+import os
+
+mcp_file = os.environ["MEM0_MCP_FILE"]
+mem0_entry = {
+    "url": "https://mcp.mem0.ai/mcp/",
+    "headers": {
+        "Authorization": "Token ${env:MEM0_API_KEY}"
+    },
+}
+
+data = {}
+if os.path.exists(mcp_file):
+    with open(mcp_file, encoding="utf-8") as f:
+        data = json.load(f)
+
+if "mcpServers" not in data or not isinstance(data["mcpServers"], dict):
+    data["mcpServers"] = {}
+
+data["mcpServers"]["mem0"] = mem0_entry
+
+with open(mcp_file, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PY
+}
+
+write_cursor_mem0_rule() {
+  [[ "$AGENT" == "cursor" ]] || return 0
+  local rules_dir="$HOME/.cursor/rules"
+  local rule_file="$rules_dir/mem0.mdc"
+  mkdir -p "$rules_dir"
+  echo "📝 Writing Cursor rule: $rule_file (Mem0)"
+  cat > "$rule_file" << 'EOF'
+---
+description: Mem0 persistent memory for AI agents
+alwaysApply: true
+---
+
+Use Mem0 MCP tools proactively to maintain long-term memory across sessions.
+
+RECALL (search_memories): At the start of a task, search for relevant past context — decisions, resolved errors, user preferences.
+
+STORE (add_memory): Store when ANY of these triggers occur:
+1. Error resolved → importance: high
+2. Architecture/design decision made → importance: high
+3. User preference discovered → importance: critical
+4. Significant task completed → importance: high
+
+Do NOT store: trivial details, ephemeral state, information already in project docs.
+
+Restart Cursor after MCP config changes. Verify: search_memories for "project setup".
+EOF
+  echo "✅ Mem0 Cursor rule installed."
+}
+
+mem0_mcp_client_name() {
+  case "$AGENT" in
+    cursor)         echo "cursor" ;;
+    github-copilot) echo "vscode" ;;
+    antigravity)    echo "opencode" ;;
+    *)              echo "cursor" ;;
+  esac
+}
+
+setup_mem0_for_agent() {
+  ensure_mem0_api_key
+
+  case "$AGENT" in
+    cursor)
+      echo "🔧 Mem0 for Cursor: MCP (~/.cursor/mcp.json) + rule (~/.cursor/rules/mem0.mdc)..."
+      merge_mem0_into_cursor_mcp
+      write_cursor_mem0_rule
+      if [[ -f "$HOME/.cursor/mcp.json" ]] && ! grep -q '"mem0"' "$HOME/.cursor/mcp.json" 2>/dev/null; then
+        echo "⚠️ ~/.cursor/mcp.json exists but may not list mem0 — check manually."
+      else
+        echo "✅ Mem0 MCP configured in ~/.cursor/mcp.json"
+      fi
+      echo ""
+      echo "ℹ️  Restart Cursor / Cursor CLI after MCP config changes."
+      echo "   Verify: search_memories for \"project setup\""
+      ;;
+    *)
+      local client
+      client="$(mem0_mcp_client_name)"
+      echo "🔧 Mem0 MCP for ${AGENT} (client: ${client})..."
+      if command -v npx &>/dev/null; then
+        npx -y mcp-add \
+          --name mem0-mcp \
+          --type http \
+          --url "https://mcp.mem0.ai/mcp/" \
+          --clients "$client" || echo "⚠️ mcp-add failed; configure Mem0 MCP manually."
+      else
+        echo "⚠️ npx not found. Add Mem0 MCP manually: https://docs.mem0.ai/integrations/cursor"
+      fi
+      ;;
+  esac
+}
+
+case "$MEMORY_TOOL" in
+  icm)
+    setup_icm_for_agent
+    ;;
+  mem0)
+    setup_mem0_for_agent
+    ;;
+  none)
+    echo "⏭️ Skipping memory tool initialization."
+    ;;
+esac
+
+# -------------------------------
+# Cursor: optimizer rule (RTK + memory + QMD or Graphify)
+# -------------------------------
 
 write_cursor_compression_rule() {
   [[ "$AGENT" == "cursor" ]] || return 0
   local rules_dir="$HOME/.cursor/rules"
   local rule_file="$rules_dir/compression.mdc"
   mkdir -p "$rules_dir"
-  echo "📝 Writing Cursor rule: $rule_file (caveman ${CAVEMAN_LEVEL}, QMD, RTK)..."
+
+  local docs_line=""
+  case "$DOCS_TOOL" in
+    qmd)
+      docs_line="- Project documentation: prefer \`qmd search\` / \`qmd query -c ${QMD_COLLECTION}\` (collection \`qmd://${QMD_COLLECTION}\`) before reading many \`.md\` files."
+      ;;
+    graphify)
+      docs_line="- Codebase relationships: prefer \`graphify query \"<question>\"\` / \`graphify path \"<From>\" \"<To>\"\` over ad-hoc grepping. Build once: \`graphify .\` → \`graphify-out/graph.json\`."
+      ;;
+  esac
+
+  local memory_line=""
+  case "$MEMORY_TOOL" in
+    icm)
+      memory_line="- Cross-session memory: use ICM MCP tools (\`icm_memory_recall\`, \`icm_memory_store\`) or CLI (\`icm recall\`, \`icm store\`). Local SQLite — https://github.com/rtk-ai/icm"
+      ;;
+    mem0)
+      memory_line="- Cross-session memory: use Mem0 MCP tools (\`search_memories\`, \`add_memory\`, \`get_memories\`). Cloud — https://github.com/mem0ai/mem0"
+      ;;
+  esac
+
+  echo "📝 Writing Cursor rule: $rule_file (RTK + ${MEMORY_TOOL} + ${DOCS_TOOL})..."
   cat > "$rule_file" << EOF
 ---
-description: Token compression defaults (RTK, QMD, caveman ${CAVEMAN_LEVEL})
+description: Token optimization defaults (RTK, ${MEMORY_TOOL}, ${DOCS_TOOL})
 alwaysApply: true
 ---
 
-## Compression defaults
+## Optimization defaults
 
-- Default reply style: **caveman ${CAVEMAN_LEVEL}** — tight prose, no filler; keep grammar, code blocks, and error strings exact.
-- Project documentation: prefer \`qmd search\` / \`qmd query -c ${QMD_COLLECTION}\` (collection \`qmd://${QMD_COLLECTION}\`) before reading many \`.md\` files.
 - Large shell file reads: prefer \`rtk read\` over \`cat\` / \`head\` when using Shell.
-- Cross-session memory: use ICM MCP tools (\`icm_memory_recall\`, \`icm_memory_store\`) or CLI (\`icm recall\`, \`icm store\`). Same SQLite DB across all tools.
+${docs_line}
+${memory_line}
 - Do not stack redundant compression (RTK already compresses Shell output via hooks).
 EOF
-  echo "✅ Cursor compression rule installed."
+  echo "✅ Cursor optimizer rule installed."
 }
 
 # -------------------------------
-# QMD
+# QMD (when DOCS_TOOL=qmd)
 # -------------------------------
 
 node_npm_ready() {
@@ -543,8 +835,6 @@ ensure_npm_prefix_bin_on_path() {
   npm_prefix="$(npm config get prefix 2>/dev/null || true)"
   npm_bin_dir="${npm_prefix}/bin"
 
-  # Some npm prefix setups (common fix for EACCES) install CLIs into a user dir
-  # like "$HOME/.npm-global/bin". Make sure it's reachable for later steps.
   if [ -d "$npm_bin_dir" ] && [[ ":$PATH:" != *":$npm_bin_dir:"* ]]; then
     export PATH="${npm_bin_dir}:$PATH"
   fi
@@ -558,62 +848,62 @@ PROJECT_SLUG="$(basename "$PWD" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '
 PROJECT_SLUG="${PROJECT_SLUG%-}"
 QMD_COLLECTION="${PROJECT_SLUG:-project}-docs"
 
-export NODE_NO_WARNINGS=1
-ensure_node_npm
-ensure_npm_prefix_bin_on_path
+setup_qmd() {
+  export NODE_NO_WARNINGS=1
+  ensure_node_npm
+  ensure_npm_prefix_bin_on_path
 
-if ! command -v qmd &> /dev/null; then
-  echo "📦 Installing QMD globally..."
-  install_global_npm_package @tobilu/qmd
-else
-  echo "✅ QMD already installed."
-fi
-
-# Antigravity CLI (agy) must already be installed — verified in require_agent_installed.
-if [[ "$AGENT" == "antigravity" ]]; then
-  ensure_local_bin_on_path
-  require_command agy "Install Antigravity CLI first: curl -fsSL https://antigravity.google/cli/install.sh | bash"
-fi
-
-if [[ ! -d docs ]]; then
-  echo "📂 No docs/ directory found. Create one?"
-  select yn in "Yes" "No"; do
-    case $yn in
-      Yes) mkdir -p docs; echo "➡️ Created docs/ directory."; break ;;
-      No)  echo "⏭️ Skipping docs creation."; break ;;
-    esac
-  done
-fi
-
-if [[ -d docs ]]; then
-  if ! qmd collection list 2>/dev/null | grep -Eq "(^|[[:space:]])${QMD_COLLECTION}([[:space:]]|$)"; then
-    echo "📚 Adding docs/ as QMD collection '${QMD_COLLECTION}'..."
-    qmd collection add ./docs --name "$QMD_COLLECTION" --mask "**/*.md"
-    echo "📝 Adding context for collection '${QMD_COLLECTION}'..."
-    qmd context add "qmd://${QMD_COLLECTION}" "Project documentation and notes"
+  if ! command -v qmd &> /dev/null; then
+    echo "📦 Installing QMD globally..."
+    install_global_npm_package @tobilu/qmd
   else
-    echo "✅ QMD collection '${QMD_COLLECTION}' already exists."
+    echo "✅ QMD already installed."
   fi
 
-  if qmd_docs_have_markdown; then
-    echo "🔄 Updating '${QMD_COLLECTION}' for semantic search..."
-    qmd_path_prefix=""
-    if [[ -x /usr/bin/node ]] && /usr/bin/node -p 'process.versions.node.split(".")[0]' 2>/dev/null | grep -qE '^2[2-9]|[3-9][0-9]'; then
-      qmd_path_prefix="PATH=/usr/bin:"
+  if [[ "$AGENT" == "antigravity" ]]; then
+    ensure_local_bin_on_path
+    require_command agy "Install Antigravity CLI first: curl -fsSL https://antigravity.google/cli/install.sh | bash"
+  fi
+
+  if [[ ! -d docs ]]; then
+    echo "📂 No docs/ directory found. Create one?"
+    select yn in "Yes" "No"; do
+      case $yn in
+        Yes) mkdir -p docs; echo "➡️ Created docs/ directory."; break ;;
+        No)  echo "⏭️ Skipping docs creation."; break ;;
+      esac
+    done
+  fi
+
+  if [[ -d docs ]]; then
+    if ! qmd collection list 2>/dev/null | grep -Eq "(^|[[:space:]])${QMD_COLLECTION}([[:space:]]|$)"; then
+      echo "📚 Adding docs/ as QMD collection '${QMD_COLLECTION}'..."
+      qmd collection add ./docs --name "$QMD_COLLECTION" --mask "**/*.md"
+      echo "📝 Adding context for collection '${QMD_COLLECTION}'..."
+      qmd context add "qmd://${QMD_COLLECTION}" "Project documentation and notes"
+    else
+      echo "✅ QMD collection '${QMD_COLLECTION}' already exists."
     fi
-    PATH="${qmd_path_prefix}${PATH}" qmd update
-    PATH="${qmd_path_prefix}${PATH}" qmd embed
-  else
-    echo "⚠️ No markdown under docs/ yet. Skipping embed."
-    echo "   When docs exist, run: qmd update && qmd embed"
-  fi
-fi
 
-HOOK_FILE=".git/hooks/post-commit"
-if [[ -d .git ]]; then
-  echo "🔧 Setting up Git hook for QMD re-embedding..."
-  mkdir -p .git/hooks
-  cat << EOF > "$HOOK_FILE"
+    if qmd_docs_have_markdown; then
+      echo "🔄 Updating '${QMD_COLLECTION}' for semantic search..."
+      qmd_path_prefix=""
+      if [[ -x /usr/bin/node ]] && /usr/bin/node -p 'process.versions.node.split(".")[0]' 2>/dev/null | grep -qE '^2[2-9]|[3-9][0-9]'; then
+        qmd_path_prefix="PATH=/usr/bin:"
+      fi
+      PATH="${qmd_path_prefix}${PATH}" qmd update
+      PATH="${qmd_path_prefix}${PATH}" qmd embed
+    else
+      echo "⚠️ No markdown under docs/ yet. Skipping embed."
+      echo "   When docs exist, run: qmd update && qmd embed"
+    fi
+  fi
+
+  local hook_file=".git/hooks/post-commit"
+  if [[ -d .git ]]; then
+    echo "🔧 Setting up Git hook for QMD re-embedding..."
+    mkdir -p .git/hooks
+    cat << EOF > "$hook_file"
 #!/bin/sh
 # Auto re-embed docs with QMD after each commit (${QMD_COLLECTION})
 if command -v qmd >/dev/null 2>&1; then
@@ -627,48 +917,18 @@ if command -v qmd >/dev/null 2>&1; then
   fi
 fi
 EOF
-  chmod +x "$HOOK_FILE"
-  echo "✅ Git hook installed: .git/hooks/post-commit"
-else
-  echo "⚠️ No .git directory found. Skipping Git hook setup."
-fi
+    chmod +x "$hook_file"
+    echo "✅ Git hook installed: .git/hooks/post-commit"
+  else
+    echo "⚠️ No .git directory found. Skipping Git hook setup."
+  fi
+}
 
 # -------------------------------
-# Caveman skill
+# Graphify (when DOCS_TOOL=graphify)
 # -------------------------------
 
-echo ""
-echo "📁 Setting up Caveman skill..."
-
-SKILL_DIR="$HOME/.agents/skills/caveman"
-if [[ -d "$SKILL_DIR" ]]; then
-  echo "✅ Caveman already installed ($SKILL_DIR)."
-else
-  echo "➡️ Adding Caveman skill for $AGENT..."
-  npx skills add JuliusBrussee/caveman -a "$AGENT" -y 2>/dev/null || npx skills add JuliusBrussee/caveman -a "$AGENT"
-fi
-
-# -------------------------------
-# Graphify (optional)
-# -------------------------------
-
-GRAPHIFY_ENABLED="no"
-if [[ -n "${ENABLE_GRAPHIFY:-}" ]]; then
-  GRAPHIFY_ENABLED="${ENABLE_GRAPHIFY}"
-  echo "Using ENABLE_GRAPHIFY=${ENABLE_GRAPHIFY} from environment."
-else
-  echo "Install Graphify? (knowledge graph over code/docs; uses pipx on Debian/WSL)"
-  select GRAPHIFY_CHOICE in "No" "Yes"; do
-    case "$GRAPHIFY_CHOICE" in
-      Yes) GRAPHIFY_ENABLED="yes"; break ;;
-      No)  GRAPHIFY_ENABLED="no"; break ;;
-    esac
-  done
-fi
-
-GRAPHIFY_AGENTS_SNIPPET=""
 ensure_python_for_graphify() {
-  # Graphify requires Python 3.10+. We only check that python3 exists and try; pip will fail if version is too old.
   command -v python3 >/dev/null 2>&1
 }
 
@@ -700,7 +960,7 @@ write_cursor_graphify_rule() {
   local rule_file="$rules_dir/graphify.mdc"
   mkdir -p "$rules_dir"
   echo "📝 Writing Cursor rule: $rule_file (Graphify)"
-  cat > "$rule_file" << EOF
+  cat > "$rule_file" << 'EOF'
 ---
 description: Graphify integration defaults (knowledge graph)
 alwaysApply: true
@@ -708,18 +968,17 @@ alwaysApply: true
 
 ## Graphify (knowledge graph)
 
-- Build once per codebase: \`graphify .\` → \`graphify-out/graph.json\`
+- Build once per codebase: `graphify .` → `graphify-out/graph.json`
 - Query relationships:
-  - \`graphify query "<question>"\`
-  - \`graphify path "<From>" "<To>"\`
-  - \`graphify explain "<Node>"\`
+  - `graphify query "<question>"`
+  - `graphify path "<From>" "<To>"`
+  - `graphify explain "<Node>"`
 
 When asked about how modules/files/definitions relate, prefer Graphify (graph queries) over grepping for ad-hoc answers.
 EOF
 }
 
 install_graphify_cli() {
-  # PyPI package is graphifyy; CLI command is graphify.
   if command -v graphify &> /dev/null; then
     echo "✅ Graphify already present: $(command -v graphify)"
     return 0
@@ -741,7 +1000,6 @@ install_graphify_cli() {
     uv tool install graphifyy && return 0
   fi
 
-  # Last resort: plain pip only when the environment is not PEP 668–managed.
   if python3 -m pip --version >/dev/null 2>&1; then
     echo "📦 Installing Graphify via pip --user (graphifyy)..."
     if python3 -m pip install --user --upgrade graphifyy 2>/dev/null; then
@@ -754,7 +1012,7 @@ install_graphify_cli() {
   return 1
 }
 
-install_graphify() {
+setup_graphify() {
   if ! ensure_python_for_graphify; then
     echo "⚠️ Python3 not found; skipping Graphify installation."
     return 0
@@ -779,17 +1037,25 @@ install_graphify() {
     graphify cursor install || echo "⚠️ graphify cursor install failed; check Cursor rule manually."
     write_cursor_graphify_rule
   fi
+
 }
 
-if [[ "$GRAPHIFY_ENABLED" == "yes" ]]; then
-  echo ""
-  echo "📁 Setting up Graphify..."
-  install_graphify
-  GRAPHIFY_AGENTS_SNIPPET=$'- **Graphify**  \n  Local knowledge graph over code/docs/media. Build once with `graphify .` (writes `graphify-out/graph.json`) then ask `graphify query` / `graphify path` about relationships. (Cursor: rule enabled via `.cursor/rules/graphify.mdc`.)\n'
-else
-  echo ""
-  echo "⏭️ Skipping Graphify installation."
-fi
+case "$DOCS_TOOL" in
+  qmd)
+    echo ""
+    echo "📁 Setting up QMD..."
+    setup_qmd
+    ;;
+  graphify)
+    echo ""
+    echo "📁 Setting up Graphify..."
+    setup_graphify
+    ;;
+  none)
+    echo ""
+    echo "⏭️ Skipping QMD and Graphify."
+    ;;
+esac
 
 write_cursor_compression_rule
 
@@ -799,26 +1065,38 @@ write_cursor_compression_rule
 
 write_agents_compression_section() {
   local target="$1"
+  local docs_snippet=""
+  local memory_snippet=""
+
+  case "$MEMORY_TOOL" in
+    icm)
+      memory_snippet=$'- **ICM**  \n  Local cross-session memory (SQLite). **Cursor:** MCP (`~/.cursor/mcp.json`) + rule (`~/.cursor/rules/icm.mdc`) — use `icm_memory_recall` / `icm_memory_store` or `icm recall` / `icm store`.\n'
+      ;;
+    mem0)
+      memory_snippet=$'- **Mem0**  \n  Cloud cross-session memory via MCP (https://github.com/mem0ai/mem0). Use `search_memories` / `add_memory` to recall and store decisions, errors, and preferences.\n'
+      ;;
+  esac
+
+  case "$DOCS_TOOL" in
+    qmd)
+      docs_snippet=$'- **QMD**  \n  Semantic search over `docs/**`. Collection: `'"${QMD_COLLECTION}"'` → `qmd://'"${QMD_COLLECTION}"'`. Prefer `qmd search` / `qmd query -c '"${QMD_COLLECTION}"'` before bulk `.md` reads.\n'
+      ;;
+    graphify)
+      docs_snippet=$'- **Graphify**  \n  Local knowledge graph over code/docs/media. Build once with `graphify .` (writes `graphify-out/graph.json`) then ask `graphify query` / `graphify path` about relationships. (Cursor: rule via `~/.cursor/rules/graphify.mdc`.)\n'
+      ;;
+  esac
+
   if [[ "$AGENT" == "antigravity" ]]; then
     cat << EOF >> "$target"
 
-## Compression Utilities
+## Optimization Utilities
 
 The following utilities are available in this environment. Agents should consider them core tools and utilize them when possible to optimize context, memory, and token usage.
 
 - **RTK**  
   Token-compression CLI proxy (60-90% savings). Configured locally in this project workspace (no global flag).
 
-- **ICM**  
-  Permanent cross-tool memory (SQLite). Stored globally at \`~/.gemini\` and automatically hooked into the agent to recall/store context.
-
-- **Caveman**  
-  Skill at \`~/.agents/skills/caveman\` (or \`~/.gemini/skills/\`). Default reply compression: **${CAVEMAN_LEVEL}** for concise, direct responses.
-
-- **QMD**  
-  Semantic search over \`docs/**\`. Collection: \`${QMD_COLLECTION}\` → \`qmd://${QMD_COLLECTION}\`. Prefer \`qmd search\` / \`qmd query -c ${QMD_COLLECTION}\` before bulk \`.md\` reads.
-
-${GRAPHIFY_AGENTS_SNIPPET}
+${memory_snippet}${docs_snippet}
 ---
 
 ## Antigravity CLI & Workspace Guidelines
@@ -831,31 +1109,42 @@ EOF
   else
     cat << EOF >> "$target"
 
-## Compression Utilities
+## Optimization Utilities
 
 The following utilities are available in this environment. Agents should consider them core tools and utilize them when possible to optimize context, memory, and token usage.
 
 - **RTK**  
   Global utility for compressing CLI outputs before they reach the agent. Cursor: \`rtk hook cursor\` on Shell (via \`rtk init --agent cursor\`).
 
-- **ICM**  
-  Permanent cross-tool memory (SQLite). **Cursor:** MCP (\`~/.cursor/mcp.json\`) + rule (\`~/.cursor/rules/icm.mdc\`) — use \`icm_memory_recall\` / \`icm_memory_store\` or \`icm recall\` / \`icm store\`. Hooks (auto-extract) apply to Claude Code / Gemini / Codex, not Cursor.
-
-- **Caveman**  
-  Skill at \`~/.agents/skills/caveman\`. Default reply compression: **${CAVEMAN_LEVEL}** (see \`~/.cursor/rules/compression.mdc\` on Cursor).
-
-- **QMD**  
-  Semantic search over \`docs/**\`. Collection: \`${QMD_COLLECTION}\` → \`qmd://${QMD_COLLECTION}\`. Prefer \`qmd search\` / \`qmd query -c ${QMD_COLLECTION}\` before bulk \`.md\` reads.
-
-${GRAPHIFY_AGENTS_SNIPPET}
+${memory_snippet}${docs_snippet}
 ---
 
 ## Usage Notes
 
-- Use QMD for project documentation; RTK for heavy Shell output; ICM for decisions/errors across sessions.
+- Use RTK for heavy Shell output.
+EOF
+    case "$MEMORY_TOOL" in
+      icm)
+        cat << EOF >> "$target"
+- Use ICM for decisions/errors/preferences across sessions (\`icm recall\` / \`icm store\`).
+EOF
+        ;;
+      mem0)
+        cat << EOF >> "$target"
+- Use Mem0 for decisions/errors/preferences across sessions (\`search_memories\` / \`add_memory\`).
+EOF
+        ;;
+    esac
+    if [[ "$DOCS_TOOL" == "qmd" ]]; then
+      cat << EOF >> "$target"
 - QMD embeddings refresh via \`.git/hooks/post-commit\` when \`docs/**\` markdown changes.
 - After adding docs, run: \`qmd update && qmd embed\`
 EOF
+    elif [[ "$DOCS_TOOL" == "graphify" ]]; then
+      cat << EOF >> "$target"
+- Build the knowledge graph once: \`graphify .\` then use \`graphify query\` for relationship questions.
+EOF
+    fi
   fi
 }
 
@@ -873,14 +1162,13 @@ if [[ ! -f "$RULE_FILE" ]]; then
     echo ""
   } > "$RULE_FILE"
   write_agents_compression_section "$RULE_FILE"
-elif ! grep -q "## Compression Utilities" "$RULE_FILE"; then
-  echo "📄 Appending compression section to $RULE_FILE..."
+elif ! grep -q "## Optimization Utilities" "$RULE_FILE" && ! grep -q "## Compression Utilities" "$RULE_FILE"; then
+  echo "📄 Appending optimization section to $RULE_FILE..."
   write_agents_compression_section "$RULE_FILE"
-elif grep -q "^- RTK$" "$RULE_FILE" 2>/dev/null || grep -q "^- ICM$" "$RULE_FILE" 2>/dev/null; then
-  echo "📄 Upgrading minimal Compression Utilities section in $RULE_FILE..."
-  # Replace minimal 4-bullet block with full section (best-effort).
+elif grep -q "^- RTK$" "$RULE_FILE" 2>/dev/null || grep -q "^- ICM$" "$RULE_FILE" 2>/dev/null || grep -q "^- Mem0$" "$RULE_FILE" 2>/dev/null || { [[ "$DOCS_TOOL" == "graphify" ]] && ! grep -q "^- \*\*Graphify\*\*" "$RULE_FILE"; }; then
+  echo "📄 Upgrading Optimization Utilities section in $RULE_FILE..."
   awk '
-    /^## Compression Utilities/ { skip=1; next }
+    /^## (Compression|Optimization) Utilities/ { skip=1; next }
     skip && /^## / { skip=0 }
     skip && /^---/ { next }
     skip && /^$/ { next }
@@ -890,7 +1178,7 @@ elif grep -q "^- RTK$" "$RULE_FILE" 2>/dev/null || grep -q "^- ICM$" "$RULE_FILE
   ' "$RULE_FILE" > "${RULE_FILE}.tmp" && mv "${RULE_FILE}.tmp" "$RULE_FILE"
   write_agents_compression_section "$RULE_FILE"
 else
-  echo "✅ $RULE_FILE already has a Compression Utilities section."
+  echo "✅ $RULE_FILE already has an Optimization Utilities section."
 fi
 
 # -------------------------------
@@ -899,10 +1187,20 @@ fi
 
 echo ""
 echo "🎉 Setup complete for agent: ${AGENT}"
-echo "   QMD collection: ${QMD_COLLECTION} (qmd://${QMD_COLLECTION})"
+echo "   Memory tool: ${MEMORY_TOOL}"
+echo "   Docs tool: ${DOCS_TOOL}"
+if [[ "$DOCS_TOOL" == "qmd" ]]; then
+  echo "   QMD collection: ${QMD_COLLECTION} (qmd://${QMD_COLLECTION})"
+fi
 echo ""
 
-if command -v qmd &> /dev/null; then
+if [[ "$MEMORY_TOOL" == "icm" ]] && command -v icm &> /dev/null; then
+  echo "📊 ICM doctor (integration health):"
+  icm doctor 2>&1 | sed 's/^/   /' || true
+  echo ""
+fi
+
+if [[ "$DOCS_TOOL" == "qmd" ]] && command -v qmd &> /dev/null; then
   echo "📊 QMD status:"
   qmd status 2>&1 | sed 's/^/   /' || true
   if qmd status 2>&1 | grep -qi "pending\|0 embedded\|need embedding"; then
@@ -911,18 +1209,28 @@ if command -v qmd &> /dev/null; then
   echo ""
 fi
 
-if [[ "$ENABLE_ICM" == "yes" ]] && command -v icm &> /dev/null; then
-  echo "📊 ICM doctor (integration health):"
-  icm doctor 2>&1 | sed 's/^/   /' || true
-  echo ""
-fi
-
 if [[ "$AGENT" == "cursor" ]]; then
   echo "Next steps for Cursor / Cursor CLI:"
-  echo "  1. Restart Cursor so MCP picks up ~/.cursor/mcp.json (icm serve)."
-  echo "  2. Allow Shell(rtk), Shell(icm), Shell(qmd) in ~/.cursor/cli-config.json if using allowlist mode."
-  echo "  3. Verify: icm recall \"project setup\"  |  qmd search \"topic\" -c ${QMD_COLLECTION}"
-  if [[ "$GRAPHIFY_ENABLED" == "yes" ]]; then
-    echo "  4. (Optional) Build Graphify graph: graphify ."
+  step=1
+  if [[ "$MEMORY_TOOL" == "icm" || "$MEMORY_TOOL" == "mem0" ]]; then
+    echo "  ${step}. Restart Cursor so MCP picks up ~/.cursor/mcp.json (${MEMORY_TOOL})."
+    step=$((step + 1))
+  fi
+  echo "  ${step}. Allow Shell(rtk) in ~/.cursor/cli-config.json if using allowlist mode."
+  step=$((step + 1))
+  case "$MEMORY_TOOL" in
+    icm)
+      echo "  ${step}. Verify ICM: icm recall \"project setup\""
+      step=$((step + 1))
+      ;;
+    mem0)
+      echo "  ${step}. Verify Mem0: search_memories for \"project setup\""
+      step=$((step + 1))
+      ;;
+  esac
+  if [[ "$DOCS_TOOL" == "qmd" ]]; then
+    echo "  ${step}. Verify QMD: qmd search \"topic\" -c ${QMD_COLLECTION}"
+  elif [[ "$DOCS_TOOL" == "graphify" ]]; then
+    echo "  ${step}. Build Graphify graph: graphify ."
   fi
 fi
