@@ -9,7 +9,8 @@
 # Optional env (non-interactive):
 #   AGENT=cursor|github-copilot|antigravity
 #   MEMORY_TOOL=icm|mem0|none    — icm: local memory; mem0: cloud memory (needs MEM0_API_KEY)
-#   DOCS_TOOL=qmd|graphify|none  — qmd: semantic search over docs/**/*.md; graphify: knowledge graph for larger repos
+#   DOCS_TOOL=qmd|graphify|none  — qmd: semantic search over docs/**/*.md; graphify: knowledge graph + MCP for larger repos
+#   BUILD_GRAPHIFY=yes|no        — when DOCS_TOOL=graphify, build graphify-out/graph.json during setup
 #   AUTO_INSTALL_PREREQS=yes|no  — approve all system prerequisite installs
 #   INSTALL_NODEJS=yes|no        — Node.js 22+ via package manager (sudo; required for QMD)
 #   INSTALL_APT_PACKAGES=yes|no  — apt packages such as pipx (sudo)
@@ -315,7 +316,7 @@ select_docs_tool() {
   echo ""
   echo "Choose a documentation/codebase context tool (pick one):"
   echo "  • QMD       — semantic search over docs/**/*.md (smaller projects, markdown docs only)"
-  echo "  • Graphify  — knowledge graph over code/docs (larger codebases, monorepos)"
+  echo "  • Graphify  — knowledge graph + Cursor MCP (larger codebases, monorepos)"
   echo "  • None      — skip both"
   select DOCS_TOOL in "qmd" "graphify" "none"; do
     [[ -n "$DOCS_TOOL" ]] && break
@@ -695,7 +696,7 @@ write_cursor_compression_rule() {
       docs_line="- Project documentation: prefer \`qmd search\` / \`qmd query -c ${QMD_COLLECTION}\` (collection \`qmd://${QMD_COLLECTION}\`) before reading many \`.md\` files."
       ;;
     graphify)
-      docs_line="- Codebase relationships: prefer \`graphify query \"<question>\"\` / \`graphify path \"<From>\" \"<To>\"\` over ad-hoc grepping. Build once: \`graphify .\` → \`graphify-out/graph.json\`."
+      docs_line="- Codebase relationships: prefer Graphify MCP (\`query_graph\`, \`get_neighbors\`, \`shortest_path\`) or CLI (\`graphify query\` / \`graphify path\`). Build once: \`graphify .\` → \`graphify-out/graph.json\`."
       ;;
   esac
 
@@ -959,60 +960,187 @@ write_cursor_graphify_rule() {
   local rules_dir="$HOME/.cursor/rules"
   local rule_file="$rules_dir/graphify.mdc"
   mkdir -p "$rules_dir"
-  echo "📝 Writing Cursor rule: $rule_file (Graphify)"
+  echo "📝 Writing Cursor rule: $rule_file (Graphify + MCP)"
   cat > "$rule_file" << 'EOF'
 ---
-description: Graphify integration defaults (knowledge graph)
+description: Graphify knowledge graph + MCP tools
 alwaysApply: true
 ---
 
 ## Graphify (knowledge graph)
 
-- Build once per codebase: `graphify .` → `graphify-out/graph.json`
-- Query relationships:
+- Build once per codebase: `graphify .` → `graphify-out/graph.json` (required before MCP works).
+- Prefer MCP tools when available: `query_graph`, `get_node`, `get_neighbors`, `shortest_path`.
+- CLI fallback:
   - `graphify query "<question>"`
   - `graphify path "<From>" "<To>"`
   - `graphify explain "<Node>"`
 
-When asked about how modules/files/definitions relate, prefer Graphify (graph queries) over grepping for ad-hoc answers.
+When asked how modules/files/definitions relate, prefer Graphify (MCP or CLI) over ad-hoc grepping.
 EOF
 }
 
-install_graphify_cli() {
-  if command -v graphify &> /dev/null; then
-    echo "✅ Graphify already present: $(command -v graphify)"
+# Resolve a Python that can `import graphify` (pipx/uv isolate the package).
+resolve_graphify_python() {
+  local candidate graphify_bin shebang
+
+  if python3 -c "import graphify" >/dev/null 2>&1; then
+    command -v python3
     return 0
   fi
 
-  ensure_local_bin_on_path
-
-  if ensure_pipx; then
-    echo "📦 Installing Graphify via pipx (graphifyy)..."
-    if pipx install graphifyy; then
+  for candidate in \
+    "$HOME/.local/share/pipx/venvs/graphifyy/bin/python" \
+    "$HOME/.local/share/uv/tools/graphifyy/bin/python"
+  do
+    if [[ -x "$candidate" ]] && "$candidate" -c "import graphify" >/dev/null 2>&1; then
+      echo "$candidate"
       return 0
     fi
-    echo "⚠️ pipx install failed; trying pipx upgrade..."
-    pipx upgrade graphifyy 2>/dev/null && return 0
+  done
+
+  graphify_bin="$(command -v graphify 2>/dev/null || true)"
+  if [[ -n "$graphify_bin" ]]; then
+    candidate="$(dirname "$graphify_bin")/python"
+    if [[ -x "$candidate" ]] && "$candidate" -c "import graphify" >/dev/null 2>&1; then
+      echo "$candidate"
+      return 0
+    fi
+    shebang="$(head -1 "$graphify_bin" 2>/dev/null | sed 's/^#![[:space:]]*//' || true)"
+    # shebang may be "/usr/bin/env python3" — only accept a real interpreter path
+    if [[ -n "$shebang" && "$shebang" != *" "* && -x "$shebang" ]] \
+      && "$shebang" -c "import graphify" >/dev/null 2>&1; then
+      echo "$shebang"
+      return 0
+    fi
+  fi
+
+  command -v python3
+}
+
+ensure_graphify_mcp_extra() {
+  # Prefer reinstall/inject with [mcp] so `python -m graphify.serve` works.
+  if python3 -c "import graphify.serve" >/dev/null 2>&1; then
+    return 0
+  fi
+  local gpy
+  gpy="$(resolve_graphify_python)"
+  if [[ -n "$gpy" ]] && "$gpy" -c "import graphify.serve" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "📦 Ensuring Graphify MCP extra (graphifyy[mcp])..."
+  if command -v pipx &> /dev/null && pipx list 2>/dev/null | grep -qi graphifyy; then
+    pipx inject graphifyy 'graphifyy[mcp]' 2>/dev/null \
+      || pipx install --force 'graphifyy[mcp]' \
+      || true
+  elif command -v uv &> /dev/null; then
+    uv tool install --force 'graphifyy[mcp]' || true
+  elif python3 -m pip --version >/dev/null 2>&1; then
+    python3 -m pip install --user --upgrade 'graphifyy[mcp]' 2>/dev/null || true
+  fi
+}
+
+merge_graphify_into_cursor_mcp() {
+  local mcp_file="$HOME/.cursor/mcp.json"
+  local graph_json="${1:-}"
+  local python_cmd="${2:-python3}"
+  mkdir -p "$HOME/.cursor"
+
+  if [[ -z "$graph_json" ]]; then
+    graph_json="$(pwd)/graphify-out/graph.json"
+  fi
+
+  if ! command -v python3 &>/dev/null; then
+    echo "⚠️ python3 not found; writing minimal ~/.cursor/mcp.json for Graphify."
+    cat > "$mcp_file" << EOF
+{
+  "mcpServers": {
+    "graphify": {
+      "command": "${python_cmd}",
+      "args": ["-m", "graphify.serve", "${graph_json}"]
+    }
+  }
+}
+EOF
+    return 0
+  fi
+
+  GRAPHIFY_MCP_FILE="$mcp_file" \
+  GRAPHIFY_PYTHON="$python_cmd" \
+  GRAPHIFY_GRAPH_JSON="$graph_json" \
+  python3 << 'PY'
+import json
+import os
+
+mcp_file = os.environ["GRAPHIFY_MCP_FILE"]
+entry = {
+    "command": os.environ["GRAPHIFY_PYTHON"],
+    "args": ["-m", "graphify.serve", os.environ["GRAPHIFY_GRAPH_JSON"]],
+}
+
+data = {}
+if os.path.exists(mcp_file):
+    with open(mcp_file, encoding="utf-8") as f:
+        data = json.load(f)
+
+if "mcpServers" not in data or not isinstance(data["mcpServers"], dict):
+    data["mcpServers"] = {}
+
+data["mcpServers"]["graphify"] = entry
+
+with open(mcp_file, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PY
+}
+
+install_graphify_cli() {
+  ensure_local_bin_on_path
+
+  if command -v graphify &> /dev/null; then
+    echo "✅ Graphify already present: $(command -v graphify)"
+    ensure_graphify_mcp_extra
+    return 0
+  fi
+
+  if ensure_pipx; then
+    echo "📦 Installing Graphify via pipx (graphifyy[mcp])..."
+    if pipx install 'graphifyy[mcp]'; then
+      return 0
+    fi
+    echo "⚠️ pipx install with [mcp] failed; trying plain graphifyy + inject..."
+    if pipx install graphifyy; then
+      pipx inject graphifyy 'graphifyy[mcp]' 2>/dev/null || true
+      return 0
+    fi
+    pipx upgrade graphifyy 2>/dev/null && pipx inject graphifyy 'graphifyy[mcp]' 2>/dev/null && return 0
   fi
 
   if command -v uv &> /dev/null; then
-    echo "📦 Installing Graphify via uv tool (graphifyy)..."
+    echo "📦 Installing Graphify via uv tool (graphifyy[mcp])..."
+    uv tool install 'graphifyy[mcp]' && return 0
     uv tool install graphifyy && return 0
   fi
 
   if python3 -m pip --version >/dev/null 2>&1; then
-    echo "📦 Installing Graphify via pip --user (graphifyy)..."
+    echo "📦 Installing Graphify via pip --user (graphifyy[mcp])..."
+    if python3 -m pip install --user --upgrade 'graphifyy[mcp]' 2>/dev/null; then
+      return 0
+    fi
     if python3 -m pip install --user --upgrade graphifyy 2>/dev/null; then
       return 0
     fi
   fi
 
   echo "⚠️ Failed to install graphifyy."
-  echo "   On Debian/Ubuntu/WSL, install pipx and retry: sudo apt install pipx && pipx install graphifyy"
+  echo "   On Debian/Ubuntu/WSL, install pipx and retry: sudo apt install pipx && pipx install 'graphifyy[mcp]'"
   return 1
 }
 
 setup_graphify() {
+  local graph_json gpy
+
   if ! ensure_python_for_graphify; then
     echo "⚠️ Python3 not found; skipping Graphify installation."
     return 0
@@ -1032,12 +1160,51 @@ setup_graphify() {
   echo "🔧 Running: graphify install"
   graphify install || echo "⚠️ graphify install failed; you can re-run manually later."
 
+  graph_json="$(pwd)/graphify-out/graph.json"
+  if [[ ! -f "$graph_json" ]]; then
+    echo ""
+    echo "No graphify-out/graph.json yet. Build knowledge graph now? (can take a while on large repos)"
+    if [[ -n "${BUILD_GRAPHIFY:-}" ]]; then
+      echo "Using BUILD_GRAPHIFY=${BUILD_GRAPHIFY} from environment."
+    elif ! is_interactive; then
+      BUILD_GRAPHIFY="no"
+      echo "⏭️ Non-interactive: skipping graph build (set BUILD_GRAPHIFY=yes to enable)."
+    else
+      select BUILD_GRAPHIFY in "No" "Yes"; do
+        case "$BUILD_GRAPHIFY" in
+          Yes|No) break ;;
+        esac
+      done
+    fi
+    if env_is_yes "${BUILD_GRAPHIFY:-}"; then
+      echo "🔧 Running: graphify ."
+      graphify . || echo "⚠️ graphify . failed; run manually later, then restart Cursor."
+    else
+      echo "⏭️ Skipping graph build. Later: graphify . && restart Cursor (MCP needs graph.json)."
+    fi
+  else
+    echo "✅ Found existing graph: ${graph_json}"
+  fi
+
   if [[ "$AGENT" == "cursor" ]]; then
     echo "🔧 Configuring Cursor integration: graphify cursor install"
     graphify cursor install || echo "⚠️ graphify cursor install failed; check Cursor rule manually."
     write_cursor_graphify_rule
-  fi
 
+    gpy="$(resolve_graphify_python)"
+    echo "🔧 Registering Graphify MCP in ~/.cursor/mcp.json"
+    echo "   python: ${gpy}"
+    echo "   graph:  ${graph_json}"
+    merge_graphify_into_cursor_mcp "$graph_json" "$gpy"
+    if [[ -f "$HOME/.cursor/mcp.json" ]] && grep -q '"graphify"' "$HOME/.cursor/mcp.json" 2>/dev/null; then
+      echo "✅ Graphify MCP configured in ~/.cursor/mcp.json"
+    else
+      echo "⚠️ Graphify MCP may not be listed in ~/.cursor/mcp.json — check manually."
+    fi
+    if [[ ! -f "$graph_json" ]]; then
+      echo "⚠️ MCP is registered but ${graph_json} is missing until you run: graphify ."
+    fi
+  fi
 }
 
 case "$DOCS_TOOL" in
@@ -1082,7 +1249,7 @@ write_agents_compression_section() {
       docs_snippet=$'- **QMD**  \n  Semantic search over `docs/**`. Collection: `'"${QMD_COLLECTION}"'` → `qmd://'"${QMD_COLLECTION}"'`. Prefer `qmd search` / `qmd query -c '"${QMD_COLLECTION}"'` before bulk `.md` reads.\n'
       ;;
     graphify)
-      docs_snippet=$'- **Graphify**  \n  Local knowledge graph over code/docs/media. Build once with `graphify .` (writes `graphify-out/graph.json`) then ask `graphify query` / `graphify path` about relationships. (Cursor: rule via `~/.cursor/rules/graphify.mdc`.)\n'
+      docs_snippet=$'- **Graphify**  \n  Local knowledge graph over code/docs/media ([Graphify-Labs/graphify](https://github.com/Graphify-Labs/graphify)). Build once with `graphify .` → `graphify-out/graph.json`. **Cursor:** MCP (`~/.cursor/mcp.json` → `python -m graphify.serve …`) + rule (`~/.cursor/rules/graphify.mdc`) — prefer `query_graph` / `get_neighbors` / `shortest_path`; CLI fallback: `graphify query` / `graphify path`.\n'
       ;;
   esac
 
@@ -1142,7 +1309,9 @@ EOF
 EOF
     elif [[ "$DOCS_TOOL" == "graphify" ]]; then
       cat << EOF >> "$target"
-- Build the knowledge graph once: \`graphify .\` then use \`graphify query\` for relationship questions.
+- Build the knowledge graph once: \`graphify .\` (writes \`graphify-out/graph.json\`).
+- Prefer Graphify MCP tools (\`query_graph\`, \`get_neighbors\`, \`shortest_path\`) over grepping; CLI fallback: \`graphify query\` / \`graphify path\`.
+- After graph changes, restart Cursor if MCP was already connected, or re-run \`graphify .\`.
 EOF
     fi
   fi
@@ -1165,7 +1334,7 @@ if [[ ! -f "$RULE_FILE" ]]; then
 elif ! grep -q "## Optimization Utilities" "$RULE_FILE" && ! grep -q "## Compression Utilities" "$RULE_FILE"; then
   echo "📄 Appending optimization section to $RULE_FILE..."
   write_agents_compression_section "$RULE_FILE"
-elif grep -q "^- RTK$" "$RULE_FILE" 2>/dev/null || grep -q "^- ICM$" "$RULE_FILE" 2>/dev/null || grep -q "^- Mem0$" "$RULE_FILE" 2>/dev/null || { [[ "$DOCS_TOOL" == "graphify" ]] && ! grep -q "^- \*\*Graphify\*\*" "$RULE_FILE"; }; then
+elif grep -q "^- RTK$" "$RULE_FILE" 2>/dev/null || grep -q "^- ICM$" "$RULE_FILE" 2>/dev/null || grep -q "^- Mem0$" "$RULE_FILE" 2>/dev/null || { [[ "$DOCS_TOOL" == "graphify" ]] && ! grep -q "query_graph\|graphify.serve\|Graphify MCP\|prefer \`query_graph\`" "$RULE_FILE"; }; then
   echo "📄 Upgrading Optimization Utilities section in $RULE_FILE..."
   awk '
     /^## (Compression|Optimization) Utilities/ { skip=1; next }
@@ -1212,8 +1381,8 @@ fi
 if [[ "$AGENT" == "cursor" ]]; then
   echo "Next steps for Cursor / Cursor CLI:"
   step=1
-  if [[ "$MEMORY_TOOL" == "icm" || "$MEMORY_TOOL" == "mem0" ]]; then
-    echo "  ${step}. Restart Cursor so MCP picks up ~/.cursor/mcp.json (${MEMORY_TOOL})."
+  if [[ "$MEMORY_TOOL" == "icm" || "$MEMORY_TOOL" == "mem0" || "$DOCS_TOOL" == "graphify" ]]; then
+    echo "  ${step}. Restart Cursor so MCP picks up ~/.cursor/mcp.json."
     step=$((step + 1))
   fi
   echo "  ${step}. Allow Shell(rtk) in ~/.cursor/cli-config.json if using allowlist mode."
@@ -1231,6 +1400,6 @@ if [[ "$AGENT" == "cursor" ]]; then
   if [[ "$DOCS_TOOL" == "qmd" ]]; then
     echo "  ${step}. Verify QMD: qmd search \"topic\" -c ${QMD_COLLECTION}"
   elif [[ "$DOCS_TOOL" == "graphify" ]]; then
-    echo "  ${step}. Build Graphify graph: graphify ."
+    echo "  ${step}. Build graph if needed: graphify .  → then verify MCP tool query_graph"
   fi
 fi

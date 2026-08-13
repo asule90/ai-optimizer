@@ -1,4 +1,4 @@
-init expressjs typescript with this project structure
+init expressjs typescript with swagger lib, with this project structure:
  +----------------+-------------------------------------------------+
  | -handler | Or controller |
  +----------------+-------------------------------------------------+
@@ -24,3 +24,5 @@ init expressjs typescript with this project structure
  +----------------+-------------------------------------------------+
  | -utils | Or helpers, |
  +----------------+-------------------------------------------------+
+ 
+  write those convention, guide as AGENTS.md development instruction
