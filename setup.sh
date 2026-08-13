@@ -436,25 +436,155 @@ install_icm_if_missing() {
   ensure_local_bin_on_path
 }
 
-icm_init_force=()
-if command -v icm &>/dev/null && icm init --help 2>&1 | grep -q -- '--force'; then
-  icm_init_force=(--force)
-fi
+resolve_icm_binary() {
+  local icm_bin
+  icm_bin="$(command -v icm 2>/dev/null || true)"
+  if [[ -n "$icm_bin" ]]; then
+    # Prefer absolute path so Cursor MCP works regardless of PATH in the IDE.
+    if command -v realpath &>/dev/null; then
+      realpath "$icm_bin"
+    elif command -v readlink &>/dev/null; then
+      readlink -f "$icm_bin" 2>/dev/null || echo "$icm_bin"
+    else
+      echo "$icm_bin"
+    fi
+    return 0
+  fi
+  if [[ -x "$HOME/.local/bin/icm" ]]; then
+    echo "$HOME/.local/bin/icm"
+    return 0
+  fi
+  echo "icm"
+}
+
+merge_icm_into_cursor_mcp() {
+  local mcp_file="$HOME/.cursor/mcp.json"
+  local icm_bin="${1:-}"
+  mkdir -p "$HOME/.cursor"
+
+  if [[ -z "$icm_bin" ]]; then
+    icm_bin="$(resolve_icm_binary)"
+  fi
+
+  if ! command -v python3 &>/dev/null; then
+    if [[ -f "$mcp_file" ]]; then
+      echo "⚠️ python3 not found; cannot safely merge ICM into existing ~/.cursor/mcp.json."
+      echo "   Add manually: \"icm\": { \"command\": \"${icm_bin}\", \"args\": [\"serve\"], \"env\": {} }"
+      return 1
+    fi
+    echo "⚠️ python3 not found; writing minimal ~/.cursor/mcp.json for ICM."
+    cat > "$mcp_file" << EOF
+{
+  "mcpServers": {
+    "icm": {
+      "command": "${icm_bin}",
+      "args": ["serve"],
+      "env": {}
+    }
+  }
+}
+EOF
+    return 0
+  fi
+
+  ICM_MCP_FILE="$mcp_file" ICM_BIN="$icm_bin" python3 << 'PY'
+import json
+import os
+
+mcp_file = os.environ["ICM_MCP_FILE"]
+entry = {
+    "command": os.environ["ICM_BIN"],
+    "args": ["serve"],
+    "env": {},
+}
+
+data = {}
+if os.path.exists(mcp_file):
+    with open(mcp_file, encoding="utf-8") as f:
+        data = json.load(f)
+
+if "mcpServers" not in data or not isinstance(data["mcpServers"], dict):
+    data["mcpServers"] = {}
+
+data["mcpServers"]["icm"] = entry
+
+with open(mcp_file, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PY
+}
+
+write_cursor_icm_rule() {
+  [[ "$AGENT" == "cursor" ]] || return 0
+  local rules_dir="$HOME/.cursor/rules"
+  local rule_file="$rules_dir/icm.mdc"
+  mkdir -p "$rules_dir"
+
+  # Prefer ICM's own skill install; only write a fallback if missing.
+  if [[ -f "$rule_file" ]]; then
+    echo "✅ ICM Cursor rule already present: $rule_file"
+    return 0
+  fi
+
+  echo "📝 Writing Cursor rule: $rule_file (ICM MCP fallback)"
+  cat > "$rule_file" << 'EOF'
+---
+description: ICM persistent local memory for AI agents
+alwaysApply: true
+---
+
+Use ICM MCP tools proactively to maintain long-term memory across sessions.
+
+RECALL (icm_memory_recall): At the start of a task, search for relevant past context — decisions, resolved errors, user preferences.
+
+STORE (icm_memory_store): Store when ANY of these triggers occur:
+1. Error resolved → topic: errors-resolved, importance: high
+2. Architecture/design decision made → topic: decisions-{project}, importance: high
+3. User preference discovered → topic: preferences, importance: critical
+4. Significant task completed → topic: context-{project}, importance: high
+
+CLI fallback: `icm recall` / `icm store`. Same SQLite DB as MCP.
+
+Do NOT store: trivial details, ephemeral state, information already in project docs.
+Restart Cursor after MCP config changes. Verify: icm_memory_recall for "project setup".
+EOF
+  echo "✅ ICM Cursor rule installed."
+}
 
 setup_icm_for_agent() {
+  local icm_bin
+  local icm_init_force=()
+
   install_icm_if_missing
   require_command icm "ICM installs to ~/.local/bin. Run: export PATH=\"\$HOME/.local/bin:\$PATH\""
+  ensure_config_dir_writable
+
+  if icm init --help 2>&1 | grep -q -- '--force'; then
+    icm_init_force=(--force)
+  fi
+
+  icm_bin="$(resolve_icm_binary)"
 
   case "$AGENT" in
     cursor)
       echo "🔧 ICM for Cursor: MCP (~/.cursor/mcp.json) + rule (~/.cursor/rules/icm.mdc)..."
-      icm init --mode mcp "${icm_init_force[@]}"
-      icm init --mode skill "${icm_init_force[@]}"
-      if [[ -f "$HOME/.cursor/mcp.json" ]] && ! grep -q '"icm"' "$HOME/.cursor/mcp.json" 2>/dev/null; then
-        echo "⚠️ ~/.cursor/mcp.json exists but may not list icm — check manually or re-run: icm init --mode mcp"
+      # Official auto-config (may no-op if Cursor not detected in some environments).
+      icm init --mode mcp "${icm_init_force[@]}" || echo "⚠️ icm init --mode mcp returned non-zero; applying explicit MCP merge."
+      icm init --mode skill "${icm_init_force[@]}" || echo "⚠️ icm init --mode skill returned non-zero; writing fallback rule."
+
+      # Explicit merge so ICM MCP coexists with Mem0/Graphify/other servers.
+      echo "🔧 Registering ICM MCP in ~/.cursor/mcp.json"
+      echo "   command: ${icm_bin} serve"
+      merge_icm_into_cursor_mcp "$icm_bin"
+      write_cursor_icm_rule
+
+      if [[ -f "$HOME/.cursor/mcp.json" ]] && grep -q '"icm"' "$HOME/.cursor/mcp.json" 2>/dev/null; then
+        echo "✅ ICM MCP configured in ~/.cursor/mcp.json"
+      else
+        echo "⚠️ ~/.cursor/mcp.json exists but may not list icm — check manually."
       fi
       if [[ ! -f "$HOME/.cursor/rules/icm.mdc" ]]; then
-        echo "⚠️ Expected ~/.cursor/rules/icm.mdc — re-run: icm init --mode skill"
+        echo "⚠️ Expected ~/.cursor/rules/icm.mdc"
       else
         echo "✅ ICM Cursor rule: ~/.cursor/rules/icm.mdc"
       fi
@@ -469,7 +599,7 @@ setup_icm_for_agent() {
       icm init --mode cli "${icm_init_force[@]}"
       ;;
     github-copilot)
-      echo "🔧 ICM for GitHub Copilot: MCP + copilot-instructions..."
+      echo "🔧 ICM for GitHub Copilot: MCP + CLI instructions..."
       icm init --mode mcp "${icm_init_force[@]}"
       icm init --mode cli "${icm_init_force[@]}"
       ;;
@@ -480,6 +610,9 @@ setup_icm_for_agent() {
     echo "Also install ICM hooks for Claude Code / Gemini / Codex? (optional; not used by Cursor)"
     if [[ -n "${ENABLE_ICM_HOOKS:-}" ]]; then
       echo "Using ENABLE_ICM_HOOKS=${ENABLE_ICM_HOOKS} from environment."
+    elif ! is_interactive; then
+      ENABLE_ICM_HOOKS="no"
+      echo "⏭️ Non-interactive: skipping ICM hooks (set ENABLE_ICM_HOOKS=yes to enable)."
     else
       select HOOKS_CHOICE in "No" "Yes"; do
         case "$HOOKS_CHOICE" in
@@ -488,7 +621,7 @@ setup_icm_for_agent() {
         esac
       done
     fi
-    if [[ "${ENABLE_ICM_HOOKS:-no}" == "yes" ]]; then
+    if env_is_yes "${ENABLE_ICM_HOOKS:-no}"; then
       ensure_gemini_settings_path
       echo "🔧 ICM hook mode (Claude Code, Gemini, Codex, Copilot CLI, OpenCode)..."
       icm init --mode hook "${icm_init_force[@]}"
@@ -552,6 +685,11 @@ merge_mem0_into_cursor_mcp() {
   mkdir -p "$HOME/.cursor"
 
   if ! command -v python3 &>/dev/null; then
+    if [[ -f "$mcp_file" ]]; then
+      echo "⚠️ python3 not found; cannot safely merge Mem0 into existing ~/.cursor/mcp.json."
+      echo "   Add Mem0 manually — see https://docs.mem0.ai/integrations/cursor"
+      return 1
+    fi
     echo "⚠️ python3 not found; writing minimal ~/.cursor/mcp.json for Mem0."
     cat > "$mcp_file" << 'EOF'
 {
@@ -1052,6 +1190,12 @@ merge_graphify_into_cursor_mcp() {
   fi
 
   if ! command -v python3 &>/dev/null; then
+    if [[ -f "$mcp_file" ]]; then
+      echo "⚠️ python3 not found; cannot safely merge Graphify into existing ~/.cursor/mcp.json."
+      echo "   Add manually:"
+      echo "   \"graphify\": { \"command\": \"${python_cmd}\", \"args\": [\"-m\", \"graphify.serve\", \"${graph_json}\"] }"
+      return 1
+    fi
     echo "⚠️ python3 not found; writing minimal ~/.cursor/mcp.json for Graphify."
     cat > "$mcp_file" << EOF
 {

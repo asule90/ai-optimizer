@@ -78,7 +78,7 @@ Set non-interactively with `DOCS_TOOL=qmd`, `DOCS_TOOL=graphify`, or `DOCS_TOOL=
 
 **ICM** (local cross-session memory)
 
-When `MEMORY_TOOL=icm`, the script runs `icm init --mode mcp` + `icm init --mode skill` for Cursor. The agent can `icm_memory_recall` / `icm_memory_store` (or `icm recall` / `icm store`) to persist decisions, errors, and preferences locally — no cloud account required.
+When `MEMORY_TOOL=icm`, the script installs ICM, runs `icm init --mode mcp` + `icm init --mode skill`, then **explicitly merges** `icm` into `~/.cursor/mcp.json` (`<abs-path>/icm serve`) so it coexists with Graphify/other MCP servers, and ensures `~/.cursor/rules/icm.mdc`. The agent can `icm_memory_recall` / `icm_memory_store` (or `icm recall` / `icm store`) — no cloud account required.
 
 **Mem0** (cloud cross-session memory)
 
