@@ -1,0 +1,3 @@
+- start video record
+- init project
+- run-everything to speed up demo
