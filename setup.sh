@@ -1118,20 +1118,23 @@ When asked how modules/files/definitions relate, prefer Graphify (MCP or CLI) ov
 EOF
 }
 
-# Resolve a Python that can `import graphify` (pipx/uv isolate the package).
+# True when INTERPRETER can run `python -m graphify.serve` (requires graphifyy[mcp]).
+graphify_python_can_serve() {
+  local interpreter="$1"
+  [[ -n "$interpreter" && -x "$interpreter" ]] \
+    && "$interpreter" -c "import graphify.serve" >/dev/null 2>&1
+}
+
+# Resolve a Python for Graphify MCP (`python -m graphify.serve`). Prefer pipx/uv
+# venvs with the [mcp] extra over system python that only has the base package.
 resolve_graphify_python() {
   local candidate graphify_bin shebang
-
-  if python3 -c "import graphify" >/dev/null 2>&1; then
-    command -v python3
-    return 0
-  fi
 
   for candidate in \
     "$HOME/.local/share/pipx/venvs/graphifyy/bin/python" \
     "$HOME/.local/share/uv/tools/graphifyy/bin/python"
   do
-    if [[ -x "$candidate" ]] && "$candidate" -c "import graphify" >/dev/null 2>&1; then
+    if graphify_python_can_serve "$candidate"; then
       echo "$candidate"
       return 0
     fi
@@ -1140,18 +1143,36 @@ resolve_graphify_python() {
   graphify_bin="$(command -v graphify 2>/dev/null || true)"
   if [[ -n "$graphify_bin" ]]; then
     candidate="$(dirname "$graphify_bin")/python"
-    if [[ -x "$candidate" ]] && "$candidate" -c "import graphify" >/dev/null 2>&1; then
+    if graphify_python_can_serve "$candidate"; then
       echo "$candidate"
       return 0
     fi
     shebang="$(head -1 "$graphify_bin" 2>/dev/null | sed 's/^#![[:space:]]*//' || true)"
     # shebang may be "/usr/bin/env python3" — only accept a real interpreter path
     if [[ -n "$shebang" && "$shebang" != *" "* && -x "$shebang" ]] \
-      && "$shebang" -c "import graphify" >/dev/null 2>&1; then
+      && graphify_python_can_serve "$shebang"; then
       echo "$shebang"
       return 0
     fi
   fi
+
+  candidate="$(command -v python3 2>/dev/null || true)"
+  if graphify_python_can_serve "$candidate"; then
+    echo "$candidate"
+    return 0
+  fi
+
+  # Fallback: CLI-only graphify (MCP will fail until graphifyy[mcp] is installed).
+  for candidate in \
+    "$HOME/.local/share/pipx/venvs/graphifyy/bin/python" \
+    "$HOME/.local/share/uv/tools/graphifyy/bin/python" \
+    "$(command -v python3 2>/dev/null || true)"
+  do
+    if [[ -n "$candidate" && -x "$candidate" ]] && "$candidate" -c "import graphify" >/dev/null 2>&1; then
+      echo "$candidate"
+      return 0
+    fi
+  done
 
   command -v python3
 }
@@ -1304,6 +1325,17 @@ setup_graphify() {
   echo "🔧 Running: graphify install"
   graphify install || echo "⚠️ graphify install failed; you can re-run manually later."
 
+  if [[ -d .git ]]; then
+    echo "🔧 Setting up Git hook for Graphify graph rebuild..."
+    if graphify hook install; then
+      echo "✅ Git hook installed: .git/hooks/post-commit (graphify)"
+    else
+      echo "⚠️ graphify hook install failed; run manually: graphify hook install"
+    fi
+  else
+    echo "⚠️ No .git directory found. Skipping Graphify git hook setup."
+  fi
+
   graph_json="$(pwd)/graphify-out/graph.json"
   if [[ ! -f "$graph_json" ]]; then
     echo ""
@@ -1335,10 +1367,14 @@ setup_graphify() {
     graphify cursor install || echo "⚠️ graphify cursor install failed; check Cursor rule manually."
     write_cursor_graphify_rule
 
+    ensure_graphify_mcp_extra
     gpy="$(resolve_graphify_python)"
     echo "🔧 Registering Graphify MCP in ~/.cursor/mcp.json"
     echo "   python: ${gpy}"
     echo "   graph:  ${graph_json}"
+    if ! graphify_python_can_serve "$gpy"; then
+      echo "⚠️ ${gpy} cannot run graphify.serve — install graphifyy[mcp] on this interpreter or use pipx."
+    fi
     merge_graphify_into_cursor_mcp "$graph_json" "$gpy"
     if [[ -f "$HOME/.cursor/mcp.json" ]] && grep -q '"graphify"' "$HOME/.cursor/mcp.json" 2>/dev/null; then
       echo "✅ Graphify MCP configured in ~/.cursor/mcp.json"
@@ -1454,6 +1490,7 @@ EOF
     elif [[ "$DOCS_TOOL" == "graphify" ]]; then
       cat << EOF >> "$target"
 - Build the knowledge graph once: \`graphify .\` (writes \`graphify-out/graph.json\`).
+- Graph rebuilds via \`.git/hooks/post-commit\` after code commits (AST-only; doc/image changes need \`graphify update .\` manually).
 - Prefer Graphify MCP tools (\`query_graph\`, \`get_neighbors\`, \`shortest_path\`) over grepping; CLI fallback: \`graphify query\` / \`graphify path\`.
 - After graph changes, restart Cursor if MCP was already connected, or re-run \`graphify .\`.
 EOF
