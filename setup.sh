@@ -16,6 +16,9 @@
 #   INSTALL_APT_PACKAGES=yes|no  — apt packages such as pipx (sudo)
 #   ALLOW_SUDO=yes|no            — sudo for npm global installs / permission fixes
 #   SKIP_AGENT_CHECK=yes|no      — skip Cursor/Copilot/Antigravity install verification (e.g. Docker)
+#   INSTALL_TGREP=yes|no         — optional fast indexed grep (https://github.com/microsoft/tgrep); unset = prompt with size hint
+#   BUILD_TGREP_INDEX=yes|no     — run `tgrep index .` during setup when tgrep is installed
+#   TGREP_START_SERVE=yes|no     — start `tgrep serve .` in background after index (optional)
 #   MEM0_API_KEY=m0-...          — Mem0 Platform API key (https://app.mem0.ai); only when MEMORY_TOOL=mem0
 # Back-compat: ENABLE_ICM=yes|no or ENABLE_MEM0=yes|no map to MEMORY_TOOL when MEMORY_TOOL is unset
 set -e
@@ -252,7 +255,7 @@ require_agent_installed() {
   esac
 }
 
-echo "🚀 AI Optimizer Setup (RTK + ICM/Mem0 + QMD/Graphify)"
+echo "🚀 AI Optimizer Setup (RTK + ICM/Mem0 + QMD/Graphify + optional tgrep)"
 echo "===================================================="
 
 # -------------------------------
@@ -828,6 +831,11 @@ write_cursor_compression_rule() {
   local rule_file="$rules_dir/compression.mdc"
   mkdir -p "$rules_dir"
 
+  local tgrep_line=""
+  if env_is_yes "${TGREP_INSTALLED:-no}"; then
+    tgrep_line="- Code search (large repos): prefer \`tgrep\` over ripgrep when an index exists (\`tgrep index .\` then \`tgrep serve .\`). Put flags before \`--\`; use \`-F\` for literals, \`-l\` to narrow files first. See https://github.com/microsoft/tgrep/blob/main/AGENTS.md"
+  fi
+
   local docs_line=""
   case "$DOCS_TOOL" in
     qmd)
@@ -860,6 +868,7 @@ alwaysApply: true
 - Large shell file reads: prefer \`rtk read\` over \`cat\` / \`head\` when using Shell.
 ${docs_line}
 ${memory_line}
+${tgrep_line}
 - Do not stack redundant compression (RTK already compresses Shell output via hooks).
 EOF
   echo "✅ Cursor optimizer rule installed."
@@ -1404,6 +1413,325 @@ case "$DOCS_TOOL" in
     ;;
 esac
 
+# -------------------------------
+# tgrep (optional — fast indexed grep for larger trees)
+# -------------------------------
+
+TGREP_INSTALLED="no"
+TGREP_SMALL_FILE_THRESHOLD=3000
+TGREP_RECOMMEND_FILE_THRESHOLD=10000
+
+estimate_searchable_file_count() {
+  local count="0"
+  if [[ -d .git ]] && command -v git &>/dev/null && git rev-parse --is-inside-work-tree &>/dev/null 2>&1; then
+    count="$(git ls-files 2>/dev/null | wc -l | tr -d ' ')"
+  fi
+  if [[ -z "$count" || "$count" -eq 0 ]]; then
+    count="$(find . \
+      \( -path './.git' -o -path './.git/*' \
+         -o -path './node_modules' -o -path './node_modules/*' \
+         -o -path './vendor' -o -path './vendor/*' \
+         -o -path './graphify-out' -o -path './graphify-out/*' \
+         -o -path './.tgrep' -o -path './.tgrep/*' \) -prune \
+      -o -type f -print 2>/dev/null | wc -l | tr -d ' ')"
+  fi
+  [[ -n "$count" ]] || count="0"
+  echo "$count"
+}
+
+tgrep_size_recommendation() {
+  local count="$1"
+  if [[ "$count" -lt "$TGREP_SMALL_FILE_THRESHOLD" ]]; then
+    echo "small"
+  elif [[ "$count" -ge "$TGREP_RECOMMEND_FILE_THRESHOLD" ]]; then
+    echo "large"
+  else
+    echo "medium"
+  fi
+}
+
+tgrep_release_asset_glob() {
+  local os arch
+  os="$(uname -s 2>/dev/null || echo unknown)"
+  arch="$(uname -m 2>/dev/null || echo unknown)"
+  case "$os" in
+    Linux)
+      case "$arch" in
+        x86_64|amd64) echo '*x86_64-unknown-linux-musl.tar.gz' ;;
+        aarch64|arm64) echo '*aarch64-unknown-linux-musl.tar.gz' ;;
+        *) return 1 ;;
+      esac
+      ;;
+    Darwin)
+      case "$arch" in
+        arm64|aarch64) echo '*aarch64-apple-darwin.tar.gz' ;;
+        x86_64) echo '*x86_64-apple-darwin.tar.gz' ;;
+        *) return 1 ;;
+      esac
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+install_tgrep_from_github_release() {
+  local pattern dest tmpdir archive inner
+  pattern="$(tgrep_release_asset_glob)" || return 1
+  dest="$HOME/.local/bin/tgrep"
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "$tmpdir"' RETURN
+
+  mkdir -p "$HOME/.local/bin"
+  if command -v gh &>/dev/null; then
+    if ! gh release download --repo microsoft/tgrep -p "$pattern" -D "$tmpdir"; then
+      return 1
+    fi
+  elif command -v curl &>/dev/null && command -v python3 &>/dev/null; then
+    if ! TGREP_ASSET_GLOB="$pattern" TGREP_TMPDIR="$tmpdir" python3 << 'PY'
+import json
+import os
+import re
+import sys
+import urllib.request
+
+glob = os.environ["TGREP_ASSET_GLOB"]
+tmpdir = os.environ["TGREP_TMPDIR"]
+rx = re.compile("^" + glob.replace(".", r"\.").replace("*", ".*") + "$")
+
+with urllib.request.urlopen(
+    "https://api.github.com/repos/microsoft/tgrep/releases/latest",
+    timeout=60,
+) as resp:
+    release = json.load(resp)
+
+asset = next((a for a in release.get("assets", []) if rx.match(a.get("name", ""))), None)
+if not asset:
+    sys.exit(1)
+
+url = asset["url"]
+req = urllib.request.Request(url, headers={"Accept": "application/octet-stream"})
+with urllib.request.urlopen(req, timeout=120) as dl:
+    path = os.path.join(tmpdir, asset["name"])
+    with open(path, "wb") as f:
+        f.write(dl.read())
+PY
+    then
+      return 1
+    fi
+  else
+    return 1
+  fi
+
+  archive="$(find "$tmpdir" -maxdepth 1 -name 'tgrep-*.tar.gz' -print -quit)"
+  [[ -n "$archive" ]] || return 1
+  tar xzf "$archive" -C "$tmpdir"
+  inner="$(find "$tmpdir" -maxdepth 2 -type f -name tgrep -print -quit)"
+  [[ -n "$inner" ]] || return 1
+  install -Dm755 "$inner" "$dest"
+  return 0
+}
+
+install_tgrep_cli() {
+  ensure_local_bin_on_path
+  if command -v tgrep &>/dev/null; then
+    echo "✅ tgrep already installed ($(command -v tgrep))."
+    return 0
+  fi
+
+  if command -v brew &>/dev/null; then
+    if ask_permission "Install tgrep via Homebrew? (microsoft/tgrep)" "INSTALL_TGREP"; then
+      echo "📦 Installing tgrep via Homebrew..."
+      if brew install tgrep; then
+        ensure_local_bin_on_path
+        return 0
+      fi
+      echo "⚠️ brew install tgrep failed; trying release binary..."
+    fi
+  fi
+
+  if ask_permission "Download tgrep pre-built binary from GitHub Releases into ~/.local/bin?" "INSTALL_TGREP"; then
+    echo "📦 Installing tgrep from GitHub Releases..."
+    if install_tgrep_from_github_release; then
+      ensure_local_bin_on_path
+      if command -v tgrep &>/dev/null; then
+        echo "✅ tgrep installed to $(command -v tgrep)"
+        return 0
+      fi
+    fi
+    echo "⚠️ GitHub release install failed."
+  fi
+
+  if command -v cargo &>/dev/null; then
+    if ask_permission "Build tgrep from source with cargo install? (slow; needs Rust toolchain)" "INSTALL_TGREP"; then
+      echo "📦 Installing tgrep via cargo (this may take several minutes)..."
+      if cargo install tgrep-cli --locked --root "$HOME/.cargo" 2>/dev/null \
+        || cargo install --git https://github.com/microsoft/tgrep.git tgrep-cli --locked --root "$HOME/.cargo" 2>/dev/null; then
+        ensure_path_contains "$HOME/.cargo/bin"
+        if command -v tgrep &>/dev/null; then
+          return 0
+        fi
+      fi
+      echo "⚠️ cargo install tgrep-cli failed."
+    fi
+  fi
+
+  echo "⚠️ Could not install tgrep automatically."
+  echo "   Install manually: https://github.com/microsoft/tgrep#installation"
+  return 1
+}
+
+ensure_gitignore_tgrep() {
+  local entry=".tgrep/"
+  if [[ ! -f .gitignore ]]; then
+    if [[ -d .git ]]; then
+      echo "$entry" >> .gitignore
+      echo "✅ Added ${entry} to .gitignore"
+    fi
+    return 0
+  fi
+  if grep -qE '^\.tgrep/?$' .gitignore 2>/dev/null || grep -qE '/\.tgrep/?$' .gitignore 2>/dev/null; then
+    return 0
+  fi
+  echo "$entry" >> .gitignore
+  echo "✅ Added ${entry} to .gitignore"
+}
+
+write_cursor_tgrep_rule() {
+  [[ "$AGENT" == "cursor" ]] || return 0
+  local rules_dir="$HOME/.cursor/rules"
+  local rule_file="$rules_dir/tgrep.mdc"
+  mkdir -p "$rules_dir"
+  echo "📝 Writing Cursor rule: $rule_file (tgrep)"
+  cat > "$rule_file" << 'EOF'
+---
+description: tgrep fast indexed search for large repositories
+alwaysApply: true
+---
+
+## tgrep (indexed grep)
+
+Microsoft trigram-indexed grep — worthwhile on larger trees (often 10k+ files). Complements Graphify/QMD; use for symbol/string search across code.
+
+Setup once per repo (do not commit `.tgrep/`):
+
+- `tgrep index .` — build index (or `tgrep serve .` builds while serving)
+- `tgrep serve .` — keep index warm (background); clients auto-connect
+
+Searching (ripgrep-like flags; put `--` before the pattern):
+
+- Prefer `tgrep` over ripgrep when `.tgrep/` exists or a server is running
+- `tgrep -F -- "SymbolName" .` — literal search
+- `tgrep -l -- "pattern" .` — file list first on broad queries
+- `tgrep -C 2 -- "pattern" path/to/file` — context lines
+- `tgrep status .` — server / index health
+
+When results must reflect unsaved or just-written files: `tgrep --no-index -- "pattern" .` (slow on large trees).
+
+https://github.com/microsoft/tgrep/blob/main/AGENTS.md
+EOF
+  echo "✅ tgrep Cursor rule installed."
+}
+
+select_tgrep_install() {
+  local file_count size_hint want_tgrep
+
+  if env_is_yes "${INSTALL_TGREP:-}"; then
+    want_tgrep="yes"
+  elif env_is_no "${INSTALL_TGREP:-}"; then
+    echo "⏭️ Skipping tgrep (INSTALL_TGREP=no)."
+    return 0
+  else
+    file_count="$(estimate_searchable_file_count)"
+    size_hint="$(tgrep_size_recommendation "$file_count")"
+
+    echo ""
+    echo "Optional: tgrep — trigram-indexed grep for fast regex search (https://github.com/microsoft/tgrep)"
+    echo "   Estimated files in this tree: ~${file_count} (tracked or under ., excluding common vendor dirs)"
+    case "$size_hint" in
+      small)
+        echo "   Size hint: small repo — built-in ripgrep/Cursor search is usually enough; tgrep is optional."
+        ;;
+      medium)
+        echo "   Size hint: medium repo — tgrep can help if you search the whole tree often."
+        ;;
+      large)
+        echo "   Size hint: large repo — tgrep is often worth it (pre-build index + optional server)."
+        ;;
+    esac
+
+    if ! is_interactive; then
+      echo "⏭️ Non-interactive: skipping tgrep (set INSTALL_TGREP=yes to install)."
+      return 0
+    fi
+
+    echo ""
+    select want_tgrep in "No" "Yes"; do
+      case "$want_tgrep" in
+        Yes) want_tgrep="yes"; break ;;
+        No)  want_tgrep="no"; break ;;
+      esac
+    done
+  fi
+
+  if ! env_is_yes "$want_tgrep"; then
+    echo "⏭️ Skipping tgrep."
+    return 0
+  fi
+
+  INSTALL_TGREP="${INSTALL_TGREP:-yes}"
+  export INSTALL_TGREP
+
+  if ! install_tgrep_cli; then
+    return 0
+  fi
+
+  require_command tgrep "tgrep should be on PATH in ~/.local/bin or ~/.cargo/bin"
+  TGREP_INSTALLED="yes"
+  ensure_gitignore_tgrep
+  write_cursor_tgrep_rule
+
+  echo ""
+  echo "Build tgrep index now? (recommended for large repos; can take a while)"
+  if [[ -n "${BUILD_TGREP_INDEX:-}" ]]; then
+    echo "Using BUILD_TGREP_INDEX=${BUILD_TGREP_INDEX} from environment."
+  elif ! is_interactive; then
+    BUILD_TGREP_INDEX="no"
+    echo "⏭️ Non-interactive: skipping index (set BUILD_TGREP_INDEX=yes)."
+  else
+    select BUILD_TGREP_INDEX in "No" "Yes"; do
+      case "$BUILD_TGREP_INDEX" in
+        Yes|No) break ;;
+      esac
+    done
+  fi
+
+  if env_is_yes "${BUILD_TGREP_INDEX:-}"; then
+    echo "🔧 Running: tgrep index ."
+    tgrep index . || echo "⚠️ tgrep index . failed; run manually later."
+  else
+    echo "⏭️ Skipping index. Later: tgrep index .  (or tgrep serve . to build while serving)"
+  fi
+
+  if env_is_yes "${TGREP_START_SERVE:-}"; then
+    if pgrep -f "tgrep serve" >/dev/null 2>&1; then
+      echo "✅ tgrep serve already appears to be running."
+    else
+      echo "🔧 Starting: tgrep serve . (background)"
+      mkdir -p .tgrep
+      nohup tgrep serve . >> .tgrep/serve.log 2>&1 &
+      echo "   Log: .tgrep/serve.log — check with: tgrep status ."
+    fi
+  else
+    echo ""
+    echo "ℹ️  For fastest repeated searches, run in a terminal: tgrep serve ."
+    echo "   (or set TGREP_START_SERVE=yes on a future setup run)"
+  fi
+}
+
+echo ""
+select_tgrep_install
+
 write_cursor_compression_rule
 
 # -------------------------------
@@ -1433,6 +1761,11 @@ write_agents_compression_section() {
       ;;
   esac
 
+  local tgrep_snippet=""
+  if env_is_yes "${TGREP_INSTALLED:-no}"; then
+    tgrep_snippet=$'- **tgrep**  \n  Trigram-indexed grep for large trees ([microsoft/tgrep](https://github.com/microsoft/tgrep)). Build once: `tgrep index .` (writes `.tgrep/`, gitignored). For repeated searches: `tgrep serve .`. Prefer `tgrep` over ripgrep when indexed; use `-F` for literals and `-l` before broad reads.\n'
+  fi
+
   if [[ "$AGENT" == "antigravity" ]]; then
     cat << EOF >> "$target"
 
@@ -1443,7 +1776,7 @@ The following utilities are available in this environment. Agents should conside
 - **RTK**  
   Token-compression CLI proxy (60-90% savings). Configured locally in this project workspace (no global flag).
 
-${memory_snippet}${docs_snippet}
+${memory_snippet}${docs_snippet}${tgrep_snippet}
 ---
 
 ## Antigravity CLI & Workspace Guidelines
@@ -1463,7 +1796,7 @@ The following utilities are available in this environment. Agents should conside
 - **RTK**  
   Global utility for compressing CLI outputs before they reach the agent. Cursor: \`rtk hook cursor\` on Shell (via \`rtk init --agent cursor\`).
 
-${memory_snippet}${docs_snippet}
+${memory_snippet}${docs_snippet}${tgrep_snippet}
 ---
 
 ## Usage Notes
@@ -1493,6 +1826,11 @@ EOF
 - Graph rebuilds via \`.git/hooks/post-commit\` after code commits (AST-only; doc/image changes need \`graphify update .\` manually).
 - Prefer Graphify MCP tools (\`query_graph\`, \`get_neighbors\`, \`shortest_path\`) over grepping; CLI fallback: \`graphify query\` / \`graphify path\`.
 - After graph changes, restart Cursor if MCP was already connected, or re-run \`graphify .\`.
+EOF
+    fi
+    if env_is_yes "${TGREP_INSTALLED:-no}"; then
+      cat << EOF >> "$target"
+- tgrep: run \`tgrep index .\` once per repo; optional \`tgrep serve .\` for fastest repeated searches. Do not commit \`.tgrep/\`.
 EOF
     fi
   fi
@@ -1539,6 +1877,11 @@ echo ""
 echo "🎉 Setup complete for agent: ${AGENT}"
 echo "   Memory tool: ${MEMORY_TOOL}"
 echo "   Docs tool: ${DOCS_TOOL}"
+if env_is_yes "${TGREP_INSTALLED:-no}"; then
+  echo "   tgrep: installed (index: ${BUILD_TGREP_INDEX:-no}, serve: ${TGREP_START_SERVE:-no})"
+else
+  echo "   tgrep: skipped"
+fi
 if [[ "$DOCS_TOOL" == "qmd" ]]; then
   echo "   QMD collection: ${QMD_COLLECTION} (qmd://${QMD_COLLECTION})"
 fi

@@ -28,6 +28,7 @@ AGENT=cursor MEMORY_TOOL=mem0 DOCS_TOOL=graphify MEM0_API_KEY=m0-your-key bash s
 | **RTK** | Compress Shell/CLI output before it reaches the agent | Always installed — `rtk init -g --agent cursor` → `~/.cursor/hooks.json` |
 | **ICM** *or* **Mem0** | Persistent cross-session memory (pick one) | **ICM**: local SQLite, no account ([rtk-ai/icm](https://github.com/rtk-ai/icm)). **Mem0**: cloud MCP, requires API key ([mem0ai/mem0](https://github.com/mem0ai/mem0)) |
 | **QMD** *or* **Graphify** | Project context (pick one) | **QMD**: semantic search over `docs/**/*.md`. **Graphify**: knowledge graph + Cursor MCP (`graphify.serve`) for larger codebases/monorepos |
+| **tgrep** (optional) | Fast indexed regex search on large trees | Prompted during setup with a file-count hint; install via Homebrew or GitHub Releases. Complements Graphify/QMD — not a replacement |
 
 ## Choosing ICM vs Mem0
 
@@ -51,6 +52,16 @@ During setup you pick **one** documentation/codebase tool:
 
 Set non-interactively with `DOCS_TOOL=qmd`, `DOCS_TOOL=graphify`, or `DOCS_TOOL=none`.
 
+## Optional tgrep (large-repo code search)
+
+After RTK/memory/docs setup, the script estimates how many files are in the tree and asks whether to install [microsoft/tgrep](https://github.com/microsoft/tgrep) — trigram-indexed grep that shines on monorepos (often 10k+ files). Small repos get a hint that built-in ripgrep is usually enough; you can still opt in.
+
+- **Install**: `INSTALL_TGREP=yes` (or answer Yes at the prompt)
+- **Index during setup**: `BUILD_TGREP_INDEX=yes`
+- **Background server**: `TGREP_START_SERVE=yes` (otherwise run `tgrep serve .` yourself)
+
+Adds `.tgrep/` to `.gitignore`, writes `~/.cursor/rules/tgrep.mdc`, and documents usage in `AGENTS.md` when enabled.
+
 ## How `setup.sh` works
 
 1. **RTK** — installs and runs `rtk init` for your agent so command output is compressed before the model sees it.
@@ -67,6 +78,9 @@ Set non-interactively with `DOCS_TOOL=qmd`, `DOCS_TOOL=graphify`, or `DOCS_TOOL=
 | `MEM0_API_KEY` | `m0-...` | Mem0 Platform API key (only when `MEMORY_TOOL=mem0`) |
 | `DOCS_TOOL` | `qmd`, `graphify`, `none` | Documentation/codebase context tool |
 | `BUILD_GRAPHIFY` | `yes` / `no` | Build `graphify-out/graph.json` during setup (when `DOCS_TOOL=graphify`) |
+| `INSTALL_TGREP` | `yes` / `no` | Install optional tgrep (skip prompt) |
+| `BUILD_TGREP_INDEX` | `yes` / `no` | Run `tgrep index .` when tgrep is installed |
+| `TGREP_START_SERVE` | `yes` / `no` | Start `tgrep serve .` in the background after setup |
 | `AUTO_INSTALL_PREREQS` | `yes` / `no` | Auto-approve system package installs |
 | `SKIP_AGENT_CHECK` | `yes` / `no` | Skip agent install verification (e.g. Docker) |
 
