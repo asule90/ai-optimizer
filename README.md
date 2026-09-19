@@ -2,11 +2,11 @@
 
 ## token compression
 
-Run from a **project root** (repo with `.git`; the script will create `docs/` if missing):
+You only need `setup.sh` file. Run from a **project root** (repo with `.git`; the script will create `docs/` if missing):  
 
 ```bash
 cd /path/to/your-repo
-bash ~/ASULE/repo/personal-workspace-setup/setup-ai-compression.sh
+./setup.sh
 ```
 
 Non-interactive example (Cursor CLI):
