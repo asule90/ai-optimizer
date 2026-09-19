@@ -46,7 +46,7 @@ Back-compat: `ENABLE_ICM=yes|no` or `ENABLE_MEM0=yes|no` map to `MEMORY_TOOL` wh
 During setup you pick **one** documentation/codebase tool:
 
 - **QMD** — best when your project knowledge lives in markdown under `docs/`. Registers a collection like `<repo>-docs`, runs `qmd embed`, and installs a `post-commit` hook to keep embeddings fresh.
-- **Graphify** — best for larger codebases or monorepos where you need relationship queries across code. Installs `graphifyy[mcp]`, registers Cursor MCP (`python -m graphify.serve …/graphify-out/graph.json`), and writes `~/.cursor/rules/graphify.mdc`. Build once with `graphify .` (or `BUILD_GRAPHIFY=yes`).
+- **Graphify** — best for larger codebases or monorepos where you need relationship queries across code. Installs `graphifyy[mcp]`, registers Cursor MCP (`python -m graphify.serve …/graphify-out/graph.json`), writes `~/.cursor/rules/graphify.mdc`, and installs a `post-commit` hook to rebuild the graph after code commits. Build once with `graphify .` (or `BUILD_GRAPHIFY=yes`).
 - **None** — skip both if you only want RTK (+ optional memory).
 
 Set non-interactively with `DOCS_TOOL=qmd`, `DOCS_TOOL=graphify`, or `DOCS_TOOL=none`.
@@ -90,4 +90,4 @@ When `DOCS_TOOL=qmd`, the script registers `docs/**/*.md` in a QMD collection, e
 
 **Graphify** (codebase relationships + MCP)
 
-When `DOCS_TOOL=graphify`, the script installs `graphifyy[mcp]`, runs `graphify cursor install`, merges a `graphify` entry into `~/.cursor/mcp.json` (`python -m graphify.serve <abs-path>/graphify-out/graph.json`), and writes Cursor rules. Run `graphify .` once (or set `BUILD_GRAPHIFY=yes`), restart Cursor, then prefer MCP tools (`query_graph`, `get_neighbors`, `shortest_path`) or CLI `graphify query` / `graphify path`.
+When `DOCS_TOOL=graphify`, the script installs `graphifyy[mcp]`, runs `graphify hook install` (post-commit graph rebuild), `graphify cursor install`, merges a `graphify` entry into `~/.cursor/mcp.json` (using a Python interpreter with the `[mcp]` extra), and writes Cursor rules. Run `graphify .` once (or set `BUILD_GRAPHIFY=yes`), restart Cursor, then prefer MCP tools (`query_graph`, `get_neighbors`, `shortest_path`) or CLI `graphify query` / `graphify path`.
