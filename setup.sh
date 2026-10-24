@@ -1735,7 +1735,7 @@ select_tgrep_install
 write_cursor_compression_rule
 
 # -------------------------------
-# GEMINI.md / AGENTS.md
+# AGENTS.md
 # -------------------------------
 
 write_agents_compression_section() {
@@ -1781,7 +1781,7 @@ ${memory_snippet}${docs_snippet}${tgrep_snippet}
 
 ## Antigravity CLI & Workspace Guidelines
 
-- **Workspace Rules (\`GEMINI.md\` / \`AGENTS.md\`)**: The agent automatically consults rules defined in the workspace root on startup.
+- **Workspace Rules (\`AGENTS.md\`)**: The agent automatically consults rules defined in the workspace root on startup.
 - **Context Control**: Proactively use \`@\` to import specific file paths in prompts to minimize token overhead.
 - **Execution Flow**: Follow the autonomous loop: **Exploration** (codebase research) → **Planning** (draft plan) → **Execution** (make changes).
 - **Terminal Sandbox**: Shell commands run in a secure terminal sandbox. Safety boundaries can be tuned in \`~/.gemini/antigravity-cli/settings.json\`.
@@ -1837,10 +1837,12 @@ EOF
 }
 
 RULE_FILE="AGENTS.md"
-if [[ -f "GEMINI.md" ]]; then
-  RULE_FILE="GEMINI.md"
-elif [[ "$AGENT" == "antigravity" ]]; then
-  RULE_FILE="GEMINI.md"
+if [[ -f "GEMINI.md" && ! -L "GEMINI.md" && ! -f "AGENTS.md" ]]; then
+  echo "ℹ️  Found legacy GEMINI.md with no AGENTS.md. Migrating to AGENTS.md..."
+  mv "GEMINI.md" "AGENTS.md"
+elif [[ -f "GEMINI.md" && -f "AGENTS.md" ]]; then
+  echo "⚠️  Both GEMINI.md and AGENTS.md exist. Focusing on AGENTS.md as uniform rules file."
+  echo "   (Consider removing GEMINI.md or symlinking it to avoid duplicated context)"
 fi
 
 if [[ ! -f "$RULE_FILE" ]]; then

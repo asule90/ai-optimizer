@@ -67,7 +67,7 @@ Adds `.tgrep/` to `.gitignore`, writes `~/.cursor/rules/tgrep.mdc`, and document
 1. **RTK** — installs and runs `rtk init` for your agent so command output is compressed before the model sees it.
 2. **ICM or Mem0** (optional, mutually exclusive) — configures persistent memory via MCP and writes agent rules.
 3. **QMD or Graphify** (optional, mutually exclusive) — indexes project docs or builds a knowledge graph so the agent can retrieve context without reading entire files.
-4. **AGENTS.md / GEMINI.md** — appends an "Optimization Utilities" section documenting what was configured.
+4. **AGENTS.md** — appends an "Optimization Utilities" section documenting what was configured.
 
 ## Environment variables
 
