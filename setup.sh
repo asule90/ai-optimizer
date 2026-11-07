@@ -2,13 +2,13 @@
 # Setup RTK, optional ICM or Mem0 memory, and optional QMD or Graphify for AI agent token optimization.
 # Run from the project root (where .git / docs / AGENTS.md live).
 #
-# Cursor / Cursor CLI:
-#   ICM  — MCP (~/.cursor/mcp.json) + rule (~/.cursor/rules/icm.mdc); local SQLite, no account
-#   Mem0 — MCP (~/.cursor/mcp.json) + rule (~/.cursor/rules/mem0.mdc); cloud, requires API key
+# Cursor / Cursor CLI / Antigravity CLI:
+#   ICM  — MCP (~/.cursor/mcp.json or ~/.gemini/settings.json) + rule; local SQLite, no account
+#   Mem0 — MCP (~/.cursor/mcp.json or ~/.gemini/config/mcp_config.json); cloud or local
 #
 # Optional env (non-interactive):
 #   AGENT=cursor|github-copilot|antigravity
-#   MEMORY_TOOL=icm|mem0|none    — icm: local memory; mem0: cloud memory (needs MEM0_API_KEY)
+#   MEMORY_TOOL=icm|mem0|none    — icm: local memory; mem0: cloud/local memory (needs MEM0_API_KEY or local MEM0_URL)
 #   DOCS_TOOL=qmd|graphify|none  — qmd: semantic search over docs/**/*.md; graphify: knowledge graph + MCP for larger repos
 #   BUILD_GRAPHIFY=yes|no        — when DOCS_TOOL=graphify, build graphify-out/graph.json during setup
 #   AUTO_INSTALL_PREREQS=yes|no  — approve all system prerequisite installs
@@ -20,6 +20,8 @@
 #   BUILD_TGREP_INDEX=yes|no     — run `tgrep index .` during setup when tgrep is installed
 #   TGREP_START_SERVE=yes|no     — start `tgrep serve .` in background after index (optional)
 #   MEM0_API_KEY=m0-...          — Mem0 Platform API key (https://app.mem0.ai); only when MEMORY_TOOL=mem0
+#   MEM0_URL=http://...          — Mem0 MCP server URL (defaults to https://mcp.mem0.ai/mcp/)
+#   MEM0_API_KEY=m0-...          — Mem0 Platform API key (https://app.mem0.ai); required unless local MEM0_URL
 # Back-compat: ENABLE_ICM=yes|no or ENABLE_MEM0=yes|no map to MEMORY_TOOL when MEMORY_TOOL is unset
 set -e
 
@@ -641,15 +643,20 @@ setup_icm_for_agent() {
 # -------------------------------
 
 ensure_mem0_api_key() {
+  if [[ -n "${MEM0_URL:-}" ]] && [[ "${MEM0_URL}" =~ ^https?://(localhost|127\.0\.0\.1|host\.docker\.internal) ]]; then
+    echo "ℹ️  Using local Mem0 URL: ${MEM0_URL} (skipping API key check)."
+    return 0
+  fi
+
   if [[ -n "${MEM0_API_KEY:-}" ]]; then
     echo "✅ MEM0_API_KEY is set."
     return 0
   fi
 
   echo ""
-  echo "Mem0 requires an API key from https://app.mem0.ai"
+  echo "Mem0 requires an API key from https://app.mem0.ai (or set MEM0_URL for local Mem0)"
   if ! is_interactive; then
-    echo "❌ Set MEM0_API_KEY and re-run."
+    echo "❌ Set MEM0_API_KEY (or local MEM0_URL) and re-run."
     exit 1
   fi
 
@@ -686,6 +693,7 @@ ensure_mem0_api_key() {
 merge_mem0_into_cursor_mcp() {
   local mcp_file="$HOME/.cursor/mcp.json"
   mkdir -p "$HOME/.cursor"
+  local mem0_url="${MEM0_URL:-https://mcp.mem0.ai/mcp/}"
 
   if ! command -v python3 &>/dev/null; then
     if [[ -f "$mcp_file" ]]; then
@@ -694,14 +702,14 @@ merge_mem0_into_cursor_mcp() {
       return 1
     fi
     echo "⚠️ python3 not found; writing minimal ~/.cursor/mcp.json for Mem0."
-    cat > "$mcp_file" << 'EOF'
+    cat > "$mcp_file" << EOF
 {
   "mcpServers": {
     "mem0": {
-      "url": "https://mcp.mem0.ai/mcp/",
+      "url": "${mem0_url}"$(if [[ -n "${MEM0_API_KEY:-}" ]]; then echo ',
       "headers": {
         "Authorization": "Token ${env:MEM0_API_KEY}"
-      }
+      }'; fi)
     }
   }
 }
@@ -709,22 +717,91 @@ EOF
     return 0
   fi
 
-  MEM0_MCP_FILE="$mcp_file" python3 << 'PY'
+  MEM0_MCP_FILE="$mcp_file" MEM0_URL="$mem0_url" python3 << 'PY'
 import json
 import os
 
 mcp_file = os.environ["MEM0_MCP_FILE"]
+mem0_url = os.environ.get("MEM0_URL", "https://mcp.mem0.ai/mcp/")
 mem0_entry = {
-    "url": "https://mcp.mem0.ai/mcp/",
-    "headers": {
-        "Authorization": "Token ${env:MEM0_API_KEY}"
-    },
+    "url": mem0_url,
 }
+api_key = os.environ.get("MEM0_API_KEY", "")
+if api_key:
+    mem0_entry["headers"] = {
+        "Authorization": "Token ${env:MEM0_API_KEY}"
+    }
 
 data = {}
 if os.path.exists(mcp_file):
     with open(mcp_file, encoding="utf-8") as f:
-        data = json.load(f)
+        try:
+            data = json.load(f)
+        except Exception:
+            data = {}
+
+if "mcpServers" not in data or not isinstance(data["mcpServers"], dict):
+    data["mcpServers"] = {}
+
+data["mcpServers"]["mem0"] = mem0_entry
+
+with open(mcp_file, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PY
+}
+
+merge_mem0_into_gemini_mcp() {
+  local config_dir="$HOME/.gemini/config"
+  local mcp_file="${config_dir}/mcp_config.json"
+  mkdir -p "$config_dir"
+  local mem0_url="${MEM0_URL:-https://mcp.mem0.ai/mcp/}"
+
+  if ! command -v python3 &>/dev/null; then
+    if [[ -f "$mcp_file" ]]; then
+      echo "⚠️ python3 not found; cannot safely merge Mem0 into existing ${mcp_file}."
+      echo "   Add Mem0 manually to ${mcp_file}."
+      return 1
+    fi
+    echo "⚠️ python3 not found; writing minimal ${mcp_file} for Mem0."
+    cat > "$mcp_file" << EOF
+{
+  "mcpServers": {
+    "mem0": {
+      "url": "${mem0_url}"$(if [[ -n "${MEM0_API_KEY:-}" ]]; then echo ',
+      "headers": {
+        "Authorization": "Token '"${MEM0_API_KEY}"'"
+      }'; fi)
+    }
+  }
+}
+EOF
+    return 0
+  fi
+
+  MEM0_MCP_FILE="$mcp_file" MEM0_URL="$mem0_url" python3 << 'PY'
+import json
+import os
+
+mcp_file = os.environ["MEM0_MCP_FILE"]
+mem0_url = os.environ.get("MEM0_URL", "https://mcp.mem0.ai/mcp/")
+api_key = os.environ.get("MEM0_API_KEY", "")
+
+mem0_entry = {
+    "url": mem0_url,
+}
+if api_key:
+    mem0_entry["headers"] = {
+        "Authorization": f"Token {api_key}"
+    }
+
+data = {}
+if os.path.exists(mcp_file):
+    with open(mcp_file, encoding="utf-8") as f:
+        try:
+            data = json.load(f)
+        except Exception:
+            data = {}
 
 if "mcpServers" not in data or not isinstance(data["mcpServers"], dict):
     data["mcpServers"] = {}
@@ -770,7 +847,6 @@ mem0_mcp_client_name() {
   case "$AGENT" in
     cursor)         echo "cursor" ;;
     github-copilot) echo "vscode" ;;
-    antigravity)    echo "opencode" ;;
     *)              echo "cursor" ;;
   esac
 }
@@ -792,6 +868,17 @@ setup_mem0_for_agent() {
       echo "ℹ️  Restart Cursor / Cursor CLI after MCP config changes."
       echo "   Verify: search_memories for \"project setup\""
       ;;
+    antigravity)
+      echo "🔧 Mem0 for Antigravity CLI: MCP (~/.gemini/config/mcp_config.json)..."
+      merge_mem0_into_gemini_mcp
+      if [[ -f "$HOME/.gemini/config/mcp_config.json" ]] && grep -q '"mem0"' "$HOME/.gemini/config/mcp_config.json" 2>/dev/null; then
+        echo "✅ Mem0 MCP configured in ~/.gemini/config/mcp_config.json"
+      else
+        echo "⚠️ ~/.gemini/config/mcp_config.json exists but may not list mem0 — check manually."
+      fi
+      echo ""
+      echo "ℹ️  Verify: agy mcp list  |  search_memories for \"project setup\""
+      ;;
     *)
       local client
       client="$(mem0_mcp_client_name)"
@@ -800,7 +887,7 @@ setup_mem0_for_agent() {
         npx -y mcp-add \
           --name mem0-mcp \
           --type http \
-          --url "https://mcp.mem0.ai/mcp/" \
+          --url "${MEM0_URL:-https://mcp.mem0.ai/mcp/}" \
           --clients "$client" || echo "⚠️ mcp-add failed; configure Mem0 MCP manually."
       else
         echo "⚠️ npx not found. Add Mem0 MCP manually: https://docs.mem0.ai/integrations/cursor"
@@ -1928,4 +2015,23 @@ if [[ "$AGENT" == "cursor" ]]; then
   elif [[ "$DOCS_TOOL" == "graphify" ]]; then
     echo "  ${step}. Build graph if needed: graphify .  → then verify MCP tool query_graph"
   fi
+elif [[ "$AGENT" == "antigravity" ]]; then
+  echo "Next steps for Antigravity CLI:"
+  step=1
+  case "$MEMORY_TOOL" in
+    icm)
+      echo "  ${step}. Verify ICM: icm recall \"project setup\""
+      step=$((step + 1))
+      ;;
+    mem0)
+      echo "  ${step}. Verify Mem0 MCP: agy mcp list"
+      step=$((step + 1))
+      ;;
+  esac
+  if [[ "$DOCS_TOOL" == "qmd" ]]; then
+    echo "  ${step}. Verify QMD: qmd search \"topic\" -c ${QMD_COLLECTION}"
+  elif [[ "$DOCS_TOOL" == "graphify" ]]; then
+    echo "  ${step}. Build graph if needed: graphify ."
+  fi
 fi
+
