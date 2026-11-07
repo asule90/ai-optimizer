@@ -35,6 +35,7 @@ services:
     stdin_open: true
     ports:
       - 8080:8080
+      - 8787:8787
     tty: true
     environment:
       AGENT: ${AGENT:-}
